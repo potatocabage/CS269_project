@@ -53,7 +53,9 @@ from common.policies.rollout_wrapper import PolicyRolloutWrapper
 from common.utils.utils import seeded_context, init_hydra_config
 from common.policies.factory import make_policy
 from common.datasets.factory import make_dataset
+from common.policies.utils import get_device_from_parameters
 from scipy.special import softmax
+from common.policies.maze_cost import get_maze_segments, calculate_maze_barrier_cost
 import time
 import json
 
@@ -71,7 +73,7 @@ class MazeEnv:
         #         v
         #       maze_shape[0] #9
         
-        self.maze = np.array([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        self.old_maze = np.array([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
                             [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1],
                             [1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1],
                             [1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1],
@@ -80,7 +82,21 @@ class MazeEnv:
                             [1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1],
                             [1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
                             [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]).astype(bool)
+
+        self.new_maze = np.array([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                            [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1],
+                            [1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+                            [1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1],
+                            [1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1],
+                            [1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1],
+                            [1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1],
+                            [1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+                            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]).astype(bool)
+        # self.maze = self.new_maze ^ self.old_maze
+        self.maze = self.new_maze
         self.gui_size = (1200, 900)
+        self.legend_width = 200
+        self.window_size = (self.gui_size[0] + self.legend_width, self.gui_size[1])
         self.fps = 10
         self.batch_size = 32        
         self.offset = 0.5 # Offset to put object in the center of the cell
@@ -92,11 +108,80 @@ class MazeEnv:
 
         # Initialize Pygame
         pygame.init()
-        self.screen = pygame.display.set_mode(self.gui_size)
+        self.screen = pygame.display.set_mode(self.window_size)
         pygame.display.set_caption("Maze")
         self.clock = pygame.time.Clock()
         self.agent_gui_pos = np.array([0, 0]) # Initialize the position of the red dot
         self.running = True
+        
+        # Precompute cost map
+        self.cost_surface = None
+        self.max_cost = 6.0 # Clamp value for visualization
+        self.compute_cost_map()
+
+    def compute_cost_map(self):
+        print("Precomputing cost map for visualization...")
+        # Create grid of pixels
+        w, h = self.gui_size
+        # Generate pixel coordinates
+        x_indices = np.arange(w)
+        y_indices = np.arange(h)
+        x_grid, y_grid = np.meshgrid(x_indices, y_indices, indexing='xy') # Shape (h, w)
+        
+        pixels = np.stack([x_grid, y_grid], axis=-1).reshape(-1, 2) # (N, 2) -> (horizontal, vertical)
+        
+        x_maze = pixels[:, 1] / self.gui_size[1] * self.maze.shape[0] - self.offset
+        y_maze = pixels[:, 0] / self.gui_size[0] * self.maze.shape[1] - self.offset
+        
+        maze_coords = np.stack([x_maze, y_maze], axis=-1) # (N, 2)
+        
+        # Calculate cost
+        segments = get_maze_segments(self.maze) # (N_segs, 4)
+        
+        # Process in batches to avoid OOM if necessary
+        trajectory = torch.tensor(maze_coords, dtype=torch.float32).unsqueeze(1) # (N, 1, 2)
+        
+        # Split into chunks just in case
+        chunk_size = 100000
+        costs = []
+        for i in range(0, len(trajectory), chunk_size):
+            traj_chunk = trajectory[i:i+chunk_size]
+            cost_chunk = calculate_maze_barrier_cost(traj_chunk, segments)
+            costs.append(cost_chunk)
+            
+        cost_values = torch.cat(costs, dim=0).squeeze(1).numpy() # (N,)
+        
+        print(f"Cost Map Stats: Min={cost_values.min():.2f}, Max={cost_values.max():.2f}, Mean={cost_values.mean():.2f}")
+        
+        # Create surface
+        # Reshape back to (h, w) for logical mapping, then transpose for pygame surface (w, h)
+        cost_grid = cost_values.reshape(h, w)
+        
+        # Normalize and map to colors
+        # Display range: from -1 (very safe) to max_cost (wall)
+        display_min = -1.0
+        display_max = self.max_cost
+        
+        cost_clamped = np.clip(cost_grid, display_min, display_max)
+        norm_cost = (cost_clamped - display_min) / (display_max - display_min)
+        
+        # Transpose for pygame (w, h)
+        norm_cost = norm_cost.T # (w, h)
+        
+        # Color Mapping: Shades of Green
+        # Green intensity: 50 to 255
+        green_channel = (50 + norm_cost * 205).astype(np.uint8)
+        
+        # Alpha: 40 (visible tint) to 220 (strong overlay)
+        alpha = (40 + norm_cost * 180).astype(np.uint8)
+        
+        zeros = np.zeros_like(green_channel)
+        
+        surface = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.surfarray.pixels3d(surface)[:] = np.stack([zeros, green_channel, zeros], axis=-1)
+        pygame.surfarray.pixels_alpha(surface)[:] = alpha
+        self.cost_surface = surface
+
 
     def check_collision(self, xy_traj):
         assert xy_traj.shape[2] == 2, "Input must be a 2D array of (x, y) coordinates."
@@ -153,8 +238,57 @@ class MazeEnv:
         surface = pygame.transform.scale(surface, self.gui_size)
         self.screen.blit(surface, (0, 0))
 
+    def draw_legend(self):
+        # Draw legend on the right side
+        legend_x = self.gui_size[0]
+        legend_w = self.legend_width
+        h = self.gui_size[1]
+        
+        # Fill background
+        self.screen.fill(self.WHITE, (legend_x, 0, legend_w, h))
+        
+        # Draw text
+        font = pygame.font.SysFont(None, 24)
+        title_surf = font.render("Cost Map", True, (0, 0, 0))
+        self.screen.blit(title_surf, (legend_x + 10, 20))
+        
+        # Draw gradient bar
+        bar_x = legend_x + 50
+        bar_y = 60
+        bar_w = 40
+        bar_h = 300
+        
+        for i in range(bar_h):
+            val = 1.0 - (i / bar_h)
+            
+            # Match the color logic used in compute_cost_map
+            green = int(50 + val * 205)
+            alpha = int(40 + val * 180)
+            
+            # Draw a line
+            # Blend with white
+            alpha_f = alpha / 255.0
+            r = int((1 - alpha_f) * 255)
+            g = int(alpha_f * green + (1 - alpha_f) * 255)
+            b = int((1 - alpha_f) * 255)
+            
+            color = (r, g, b)
+            pygame.draw.line(self.screen, color, (bar_x, bar_y + i), (bar_x + bar_w, bar_y + i))
+            
+        # Draw labels
+        label_max = font.render(f"{self.max_cost:.1f}", True, (0, 0, 0))
+        label_min = font.render("-1.0", True, (0, 0, 0))
+        
+        self.screen.blit(label_max, (bar_x + bar_w + 10, bar_y))
+        self.screen.blit(label_min, (bar_x + bar_w + 10, bar_y + bar_h - 10))
+
     def update_screen(self, xy_pred=None, collisions=None, scores=None, keep_drawing=False, traj_in_gui_space=False):
         self.draw_maze_background()
+        
+        # Draw cost overlay
+        if self.cost_surface is not None:
+            self.screen.blit(self.cost_surface, (0, 0))
+            
         if xy_pred is not None:
             time_colors = self.generate_time_color_map(xy_pred.shape[1])
             if collisions is None:
@@ -184,7 +318,7 @@ class MazeEnv:
             for i in range(len(self.draw_traj) - 1):
                 pygame.draw.line(self.screen, self.GRAY, self.draw_traj[i], self.draw_traj[i + 1], 10)
 
-  
+        self.draw_legend()
         pygame.display.flip()
 
     def similarity_score(self, samples, guide=None):
@@ -210,13 +344,18 @@ class MazeEnv:
 
 class UnconditionalMaze(MazeEnv):
     # for dragging the agent around to explore motion manifold
-    def __init__(self, policy, policy_tag=None):
+    def __init__(self, policy, policy_tag=None, maze_cost_weight=0.0):
         super().__init__()
         self.mouse_pos = None
         self.agent_in_collision = False
         self.agent_history_xy = []
         self.policy = policy
         self.policy_tag = policy_tag
+        # Set maze in diffusion policy if applicable
+        if policy is not None and policy_tag == 'dp' and hasattr(policy, 'diffusion'):
+            device = get_device_from_parameters(policy) if policy is not None else torch.device("cpu")
+            maze_tensor = torch.from_numpy(self.maze.astype(float)).float().to(device)
+            policy.diffusion.set_maze(maze_tensor, cost_weight=maze_cost_weight)
 
     def infer_target(self, guide=None, visualizer=None):
         agent_hist_xy = self.agent_history_xy[-1] 
@@ -224,19 +363,22 @@ class UnconditionalMaze(MazeEnv):
         if self.policy_tag == 'dp':
             agent_hist_xy = agent_hist_xy.repeat(2, axis=0)
 
+        device = get_device_from_parameters(self.policy) if self.policy is not None else torch.device("cpu")
+        device_type = "cuda" if device.type == "cuda" else "cpu"
+
         obs_batch = {
             "observation.state": einops.repeat(
-                torch.from_numpy(agent_hist_xy).float().cuda(), "t d -> b t d", b=self.batch_size
+                torch.from_numpy(agent_hist_xy).float().to(device), "t d -> b t d", b=self.batch_size
             )
         }
         obs_batch["observation.environment_state"] = einops.repeat(
-            torch.from_numpy(agent_hist_xy).float().cuda(), "t d -> b t d", b=self.batch_size
+            torch.from_numpy(agent_hist_xy).float().to(device), "t d -> b t d", b=self.batch_size
         )
         
         if guide is not None:
-            guide = torch.from_numpy(guide).float().cuda()
+            guide = torch.from_numpy(guide).float().to(device)
 
-        with torch.autocast(device_type="cuda"), seeded_context(0):
+        with torch.autocast(device_type=device_type), seeded_context(0):
             if self.policy_tag == 'act':
                 actions = self.policy.run_inference(obs_batch).cpu().numpy()
             else:
@@ -277,8 +419,8 @@ class UnconditionalMaze(MazeEnv):
 
 class ConditionalMaze(UnconditionalMaze):
     # for interactive guidance dataset collection
-    def __init__(self, policy, vis_dp_dynamics=False, savepath=None, alignment_strategy=None, policy_tag=None):
-        super().__init__(policy, policy_tag=policy_tag)
+    def __init__(self, policy, vis_dp_dynamics=False, savepath=None, alignment_strategy=None, policy_tag=None, maze_cost_weight=0.0):
+        super().__init__(policy, policy_tag=policy_tag, maze_cost_weight=maze_cost_weight)
         self.drawing = False
         self.keep_drawing = False
         self.vis_dp_dynamics = vis_dp_dynamics
@@ -363,11 +505,11 @@ class ConditionalMaze(UnconditionalMaze):
 
 class MazeExp(ConditionalMaze):
     # for replaying the trials and benchmarking the alignment strategies
-    def __init__(self, policy, vis_dp_dynamics=False, savepath=None, alignment_strategy=None, policy_tag=None, loadpath=None):
-        super().__init__(policy, vis_dp_dynamics, savepath, policy_tag=policy_tag)
+    def __init__(self, policy, vis_dp_dynamics=False, savepath=None, alignment_strategy=None, policy_tag=None, loadpath=None, maze_cost_weight=0.0):
+        super().__init__(policy, vis_dp_dynamics, savepath, alignment_strategy, policy_tag=policy_tag, maze_cost_weight=maze_cost_weight)
         # Load saved trails
         assert loadpath is not None
-        with open(args.loadpath, "r", buffering=1) as file:
+        with open(loadpath, "r", buffering=1) as file:
             file.seek(0)
             trials = [json.loads(line) for line in file]
             # set random seed and shuffle the trials
@@ -386,7 +528,7 @@ class MazeExp(ConditionalMaze):
 
     def run(self):
         if self.savepath is not None:
-            self.savefile = open(savepath, "w+", buffering=1)
+            self.savefile = open(self.savepath, "w+", buffering=1)
             self.trial_idx = 0
 
         while self.trial_idx < len(self.trials):
@@ -472,11 +614,33 @@ if __name__ == "__main__":
     parser.add_argument('-v', '--vis_dp_dynamics', action='store_true', help="Visualize dynamics in DP")
     parser.add_argument('-s', '--savepath', type=str, default=None, help="Filename to save the drawing")
     parser.add_argument('-l', '--loadpath', type=str, default=None, help="Filename to load the drawing")
+    parser.add_argument('-mcw', '--maze_cost_weight', type=float, default=0.0, help="Weight for maze wall cost function in reverse diffusion (0.0 = disabled)")
 
     args = parser.parse_args()
 
     # Create and load the policy
-    device = torch.device("cuda")
+    # Check if CUDA is available and compatible
+    device = torch.device("cpu")  # Default to CPU
+    if torch.cuda.is_available():
+        try:
+            # Test CUDA compatibility by creating a tensor and performing operations
+            # that require actual CUDA kernel execution (not just memory allocation)
+            test_tensor = torch.zeros(10).cuda()
+            # Perform operations that require CUDA kernels to be executed
+            result = torch.isinf(test_tensor).any()
+            # Force synchronization by accessing the result
+            _ = result.item()
+            # Test another operation that requires kernels
+            test_tensor = test_tensor + 1.0
+            _ = test_tensor.sum().item()
+            device = torch.device("cuda")
+            print("Using CUDA device")
+        except (torch.AcceleratorError) as e:
+            print(f"CUDA is available but not compatible with this PyTorch installation: {e}")
+            print("Falling back to CPU (this will be slower)")
+            device = torch.device("cpu")
+    else:
+        print("CUDA not available, using CPU (this will be slower)")
 
     alignment_strategy = 'post-hoc'
     if args.post_hoc:
@@ -507,19 +671,19 @@ if __name__ == "__main__":
         policy.diffusion.num_inference_steps = 10
         policy.config.n_action_steps = policy.config.horizon - policy.config.n_obs_steps + 1
         policy_tag = 'dp'
-        policy.cuda()
+        policy.to(device)
         policy.eval()
     elif args.policy in ["act"]:
         policy = ACTPolicy.from_pretrained(pretrained_policy_path)
         policy_tag = 'act'
-        policy.cuda()
+        policy.to(device)
         policy.eval()
     else:
         policy = None
         policy_tag = None
 
     if args.unconditional:
-        interactiveMaze = UnconditionalMaze(policy, policy_tag=policy_tag)
+        interactiveMaze = UnconditionalMaze(policy, policy_tag=policy_tag, maze_cost_weight=args.maze_cost_weight)
     elif args.loadpath is not None:
         if args.savepath is None:
             savepath = None
@@ -534,7 +698,7 @@ if __name__ == "__main__":
             elif alignment_strategy == 'stochastic-sampling':
                 alignment_tag = 'ss'
             savepath = f"{args.loadpath[:-5]}_{policy_tag}_{alignment_tag}{args.savepath}"
-        interactiveMaze = MazeExp(policy, args.vis_dp_dynamics, savepath, alignment_strategy, policy_tag=policy_tag, loadpath=args.loadpath)
+        interactiveMaze = MazeExp(policy, args.vis_dp_dynamics, savepath, alignment_strategy, policy_tag=policy_tag, loadpath=args.loadpath, maze_cost_weight=args.maze_cost_weight)
     else:
-        interactiveMaze = ConditionalMaze(policy, args.vis_dp_dynamics, args.savepath, alignment_strategy, policy_tag=policy_tag)
+        interactiveMaze = ConditionalMaze(policy, args.vis_dp_dynamics, args.savepath, alignment_strategy, policy_tag=policy_tag, maze_cost_weight=args.maze_cost_weight)
     interactiveMaze.run()

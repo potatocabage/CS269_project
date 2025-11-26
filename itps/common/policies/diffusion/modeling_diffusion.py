@@ -40,6 +40,7 @@ from common.policies.utils import (
     get_dtype_from_parameters,
 )
 import time
+from common.policies.maze_cost import get_maze_segments, calculate_maze_barrier_cost, clamped_barrier_cost_gradient, calculate_trajectory_intersection_cost_gradient
 
 class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
     """
@@ -166,6 +167,24 @@ class DiffusionModel(nn.Module):
 
         assert alginment_strategy in ['post-hoc', 'guided-diffusion', 'stochastic-sampling', 'biased-initialization', 'output-perturb'], 'Invalid alignment strategy: ' + str(alginment_strategy)
         self.alignment_strategy = alginment_strategy
+        
+        # Maze information for wall cost function (set during inference)
+        self.maze = None  # Will be a torch.Tensor of shape (maze_height, maze_width) with 1 for walls, 0 for free space
+        self.maze_cost_weight = 0.0  # Weight for maze wall cost function (can be set during inference)
+    
+    def set_maze(self, maze: Tensor, cost_weight: float = 1.0):
+        """
+        Set the maze for wall cost function computation.
+        
+        Args:
+            maze: (maze_height, maze_width) tensor with 1 for walls, 0 for free space
+            cost_weight: Weight for the maze wall cost function in the reverse diffusion process
+        """
+        self.maze = maze
+        self.maze_cost_weight = cost_weight
+
+        self.maze_segments = get_maze_segments(maze)
+        self.maze_segments = self.maze_segments.to(get_device_from_parameters(self))
 
     # ========= inference  ============
     def conditional_sample(
@@ -234,6 +253,15 @@ class DiffusionModel(nn.Module):
                 else:
                     pass
                     # print('NOT ADDING INTERACTION GRADIENT AT TIMESTEP: ', t)
+                
+                # add maze wall cost gradient
+                if self.maze is not None and self.maze_cost_weight > 0:
+                    # Compute gradient of maze wall cost function
+                    # The method handles normalization internally via autograd chain rule
+                    maze_grad = self.maze_wall_cost_gradient(sample, normalizer=normalizer)
+                    
+                    # Adjust the sign: we want to minimize cost, so subtract the gradient
+                    model_output = model_output - self.maze_cost_weight * maze_grad
 
                 # Compute previous image: x_t -> x_t-1
                 scheduler_output = self.noise_scheduler.step(model_output, t, sample, generator=generator)
@@ -268,6 +296,60 @@ class DiffusionModel(nn.Module):
             dist = dist.mean(dim=1) # (B,)
             grad = torch.autograd.grad(dist, naction, grad_outputs=torch.ones_like(dist), create_graph=False)[0]
             # naction.detach()
+        return grad
+    
+    def maze_wall_cost_gradient(self, naction_normalized, normalizer=None, cost_type='intersection'):
+        """
+        Compute gradient of maze wall cost function.
+        
+        Args:
+            naction_normalized: (B, pred_horizon, action_dim) tensor of trajectory coordinates in normalized space
+            normalizer: Optional normalizer (DiffusionPolicy or Unnormalize instance) to convert normalized -> unnormalized coordinates
+        
+        Returns:
+            grad: (B, pred_horizon, action_dim) gradient tensor in normalized space
+        """
+        if self.maze is None:
+            return torch.zeros_like(naction_normalized)
+        
+        with torch.enable_grad():
+            naction_normalized = naction_normalized.clone().detach().requires_grad_(True)
+            
+            # Manually unnormalize with gradients enabled (since normalizer uses @torch.no_grad)
+            if normalizer is not None:
+                # Get normalization parameters
+                # normalizer might be DiffusionPolicy (has unnormalize_outputs) or Unnormalize directly
+                if hasattr(normalizer, 'unnormalize_outputs'):
+                    unnormalize_module = normalizer.unnormalize_outputs
+                else:
+                    unnormalize_module = normalizer
+                
+                key = "action"
+                buffer = getattr(unnormalize_module, "buffer_" + key.replace(".", "_"))
+                mode = unnormalize_module.modes[key]
+                
+                if mode == "mean_std":
+                    mean = buffer["mean"]
+                    std = buffer["std"]
+                    naction_unnorm = naction_normalized * std + mean
+                elif mode == "min_max":
+                    min_val = buffer["min"]
+                    max_val = buffer["max"]
+                    naction_unnorm = (naction_normalized + 1) / 2
+                    naction_unnorm = naction_unnorm * (max_val - min_val) + min_val
+                else:
+                    raise ValueError(f"Unknown normalization mode: {mode}")
+            else:
+                # Assume coordinates are already in maze space (for backward compatibility)
+                naction_unnorm = naction_normalized
+            
+            if cost_type == 'barrier':
+                grad = clamped_barrier_cost_gradient(naction_unnorm, self.maze_segments)
+            elif cost_type == 'intersection':
+                grad = calculate_trajectory_intersection_cost_gradient(naction_unnorm, self.maze_segments)
+            else:
+                raise ValueError(f"Unknown cost type: {cost_type}")
+            
         return grad    
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
