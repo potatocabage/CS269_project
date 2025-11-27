@@ -40,7 +40,14 @@ from common.policies.utils import (
     get_dtype_from_parameters,
 )
 import time
-from common.policies.maze_cost import get_maze_segments, calculate_maze_barrier_cost, clamped_barrier_cost_gradient, calculate_trajectory_intersection_cost_gradient
+from common.policies.maze_cost import (
+    get_maze_segments,
+    calculate_maze_barrier_cost,
+    clamped_barrier_cost_gradient,
+    calculate_trajectory_intersection_cost_gradient,
+    calculate_virtual_tail_cost_gradient,
+    calculate_combo_trajectory_intersection_and_virtual_tail_cost_gradient,
+)
 
 class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
     """
@@ -171,17 +178,21 @@ class DiffusionModel(nn.Module):
         # Maze information for wall cost function (set during inference)
         self.maze = None  # Will be a torch.Tensor of shape (maze_height, maze_width) with 1 for walls, 0 for free space
         self.maze_cost_weight = 0.0  # Weight for maze wall cost function (can be set during inference)
+        self.apply_cost_on_clean = False # Whether to apply the cost on the estimated clean sample or the noisy sample
     
-    def set_maze(self, maze: Tensor, cost_weight: float = 1.0):
+    def set_maze(self, maze: Tensor, cost_weight: float = 1.0, apply_on_clean: bool = False):
         """
         Set the maze for wall cost function computation.
         
         Args:
             maze: (maze_height, maze_width) tensor with 1 for walls, 0 for free space
             cost_weight: Weight for the maze wall cost function in the reverse diffusion process
+            apply_on_clean: Whether to apply the cost gradient on the estimated clean sample (DPS style)
+                            or on the noisy sample (standard guidance).
         """
         self.maze = maze
         self.maze_cost_weight = cost_weight
+        self.apply_cost_on_clean = apply_on_clean
 
         self.maze_segments = get_maze_segments(maze)
         self.maze_segments = self.maze_segments.to(get_device_from_parameters(self))
@@ -226,7 +237,7 @@ class DiffusionModel(nn.Module):
             if visualizer is not None and normalizer is not None:
                 sample_viz = normalizer.unnormalize_outputs({"action": sample.clone().detach()})["action"]
                 sample_viz = sample_viz.cpu().numpy()
-                visualizer.update_screen(sample_viz, keep_drawing=True)
+                visualizer.update_screen(sample_viz, keep_drawing=True, label="noisy")
                 time.sleep(0.1)
 
             if t > start_influence_step:
@@ -239,7 +250,8 @@ class DiffusionModel(nn.Module):
                     torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
                     global_cond=global_cond,
                 )
-
+                
+                # ... existing gradient logic ...
                 # add interaction gradient
                 if guide is not None and t > final_influence_step:
                     grad = self.guide_gradient(sample, guide)
@@ -256,17 +268,45 @@ class DiffusionModel(nn.Module):
                 
                 # add maze wall cost gradient
                 if self.maze is not None and self.maze_cost_weight > 0:
-                    # Compute gradient of maze wall cost function
-                    # The method handles normalization internally via autograd chain rule
-                    maze_grad = self.maze_wall_cost_gradient(sample, normalizer=normalizer)
-                    
-                    # Adjust the sign: we want to minimize cost, so subtract the gradient
-                    model_output = model_output - self.maze_cost_weight * maze_grad
+                    if not self.apply_cost_on_clean:
+                        # Compute gradient of maze wall cost function on the NOISY sample
+                        # The method handles normalization internally via autograd chain rule
+                        maze_grad = self.maze_wall_cost_gradient(sample, normalizer=normalizer)
+                        
+                        # Adjust the sign: we want to minimize cost, so subtract the gradient
+                        model_output = model_output - self.maze_cost_weight * maze_grad
 
                 # Compute previous image: x_t -> x_t-1
                 scheduler_output = self.noise_scheduler.step(model_output, t, sample, generator=generator)
                 prev_sample = scheduler_output.prev_sample
                 clean_sample = scheduler_output.pred_original_sample
+                
+                # Visualize clean sample (hat{x}_0)
+                if visualizer is not None and normalizer is not None:
+                     clean_viz = normalizer.unnormalize_outputs({"action": clean_sample.clone().detach()})["action"]
+                     clean_viz = clean_viz.cpu().numpy()
+                     visualizer.update_screen(clean_viz, keep_drawing=True, label="clean")
+
+                # If applying cost on clean sample (DPS style), we adjust prev_sample based on gradient at clean_sample
+                if self.maze is not None and self.maze_cost_weight > 0 and self.apply_cost_on_clean:
+                     maze_grad = self.maze_wall_cost_gradient(clean_sample, normalizer=normalizer)
+                     
+                     # DPS update: x_{t-1} <- x_{t-1} - gamma * grad
+                     prev_sample = prev_sample - self.maze_cost_weight * maze_grad
+
+                     # Visualize clean sample with gradient applied (to show direction of pull on clean projection)
+                     # Approximating effect on clean sample for visualization
+                     if visualizer is not None and normalizer is not None:
+                         # Note: The actual update is on prev_sample (x_{t-1}).
+                         # Visualizing (clean_sample - grad) gives intuition of where the clean projection is being pulled.
+                         clean_grad_viz_sample = clean_sample - self.maze_cost_weight * maze_grad
+                         clean_grad_viz = normalizer.unnormalize_outputs({"action": clean_grad_viz_sample.clone().detach()})["action"]
+                         clean_grad_viz = clean_grad_viz.cpu().numpy()
+                         visualizer.update_screen(clean_grad_viz, keep_drawing=True, label="clean_grad")
+                elif visualizer is not None and normalizer is not None and self.apply_cost_on_clean:
+                     # Emit a placeholder for sync if we are in clean-guidance mode but cost is 0 (e.g. unguided baseline)
+                     # Just repeat clean sample
+                     visualizer.update_screen(clean_viz, keep_drawing=True, label="clean_grad")
 
                 if i < MCMC_steps - 1:
                     # print('mcmc step i: ', i, 'at t: ', t)
@@ -298,7 +338,7 @@ class DiffusionModel(nn.Module):
             # naction.detach()
         return grad
     
-    def maze_wall_cost_gradient(self, naction_normalized, normalizer=None, cost_type='intersection'):
+    def maze_wall_cost_gradient(self, naction_normalized, normalizer=None, cost_type='virtual_tail'):
         """
         Compute gradient of maze wall cost function.
         
@@ -347,6 +387,10 @@ class DiffusionModel(nn.Module):
                 grad = clamped_barrier_cost_gradient(naction_unnorm, self.maze_segments)
             elif cost_type == 'intersection':
                 grad = calculate_trajectory_intersection_cost_gradient(naction_unnorm, self.maze_segments)
+            elif cost_type == 'virtual_tail':
+                grad = calculate_virtual_tail_cost_gradient(naction_unnorm, self.maze_segments)
+            elif cost_type == 'combo':
+                grad = calculate_combo_trajectory_intersection_and_virtual_tail_cost_gradient(naction_unnorm, self.maze_segments)
             else:
                 raise ValueError(f"Unknown cost type: {cost_type}")
             

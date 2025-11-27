@@ -18,16 +18,18 @@ from common.utils.utils import seeded_context
 from common.policies.utils import get_device_from_parameters
 from interact_maze2d import MazeEnv, UnconditionalMaze
 
+import imageio
+
 class StepCollector:
     def __init__(self):
         self.steps = []
     
-    def update_screen(self, xy_pred, keep_drawing=True, **kwargs):
+    def update_screen(self, xy_pred, keep_drawing=True, label=None, **kwargs):
         # xy_pred is (B, T, 2) or (T, 2)
         # We store CPU numpy copy
         if isinstance(xy_pred, torch.Tensor):
             xy_pred = xy_pred.cpu().numpy()
-        self.steps.append(xy_pred.copy())
+        self.steps.append({'data': xy_pred.copy(), 'label': label})
 
 class DenoisingVizEnv(MazeEnv):
     def __init__(self, policy, args):
@@ -55,12 +57,13 @@ class DenoisingVizEnv(MazeEnv):
         self.font = pygame.font.SysFont(None, 36)
         
         # Setup logging
-        self.log_file = open("denoising_log.txt", "w")
+        self.log_file = open("denoising_log.log", "w")
         
         # Agent state
         self.agent_history_xy = []
         self.agent_gui_pos = np.array([0, 0])
         self.agent_color = self.RED
+        self.frames = []
         
         # Override batch size to 1 for this visualization
         self.batch_size = 1
@@ -70,7 +73,7 @@ class DenoisingVizEnv(MazeEnv):
         maze_img = pygame.transform.scale(maze_img, self.gui_size)
         surface.blit(maze_img, (0, 0))
 
-    def draw_trajectory_on_surface(self, surface, xy_pred, color, label=None):
+    def draw_trajectory_on_surface(self, surface, xy_pred, color, label=None, width=2):
         # xy_pred: (B, T, 2)
         time_colors = self.generate_time_color_map(xy_pred.shape[1])
         
@@ -83,9 +86,10 @@ class DenoisingVizEnv(MazeEnv):
                 start_pos = self.xy2gui(pred[step_idx])
                 end_pos = self.xy2gui(pred[step_idx + 1])
                 
-                pygame.draw.circle(surface, draw_color, start_pos, 4)
-                # Optional: draw lines for better visibility
-                pygame.draw.line(surface, draw_color, start_pos, end_pos, 2)
+                # Draw lines for visibility
+                pygame.draw.line(surface, draw_color, start_pos, end_pos, width)
+                # Draw small circle at joints
+                pygame.draw.circle(surface, draw_color, start_pos, width+1)
                 
         # Draw Agent
         pygame.draw.circle(surface, self.agent_color, (int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])), 10)
@@ -118,7 +122,7 @@ class DenoisingVizEnv(MazeEnv):
         if hasattr(self.policy, 'diffusion'):
              device = get_device_from_parameters(self.policy)
              maze_tensor = torch.from_numpy(self.maze.astype(float)).float().to(device)
-             self.policy.diffusion.set_maze(maze_tensor, cost_weight=weight)
+             self.policy.diffusion.set_maze(maze_tensor, cost_weight=weight, apply_on_clean=self.args.clean_guidance)
              
     def infer_target(self, visualizer=None):
         # Helper to run inference using current agent state
@@ -149,55 +153,158 @@ class DenoisingVizEnv(MazeEnv):
             # conditional_sample calls visualizer.update_screen
             _ = self.policy.run_inference(obs_batch, visualizer=visualizer)
 
+    def draw_legend_box(self, surface, x, y):
+        # Draw a legend for the trajectory types
+        font = pygame.font.SysFont(None, 24)
+        legend_items = [
+            ("Noisy", (200, 200, 200)), # Grey
+            ("Clean Est", (0, 255, 0)), # Green
+            ("Clean+Grad", (255, 0, 0)), # Red
+            ("Baseline", (0, 0, 255)) # Blue (for left panel)
+        ]
+        
+        box_w, box_h = 160, 110
+        pygame.draw.rect(surface, (255, 255, 255), (x, y, box_w, box_h))
+        pygame.draw.rect(surface, (0, 0, 0), (x, y, box_w, box_h), 1)
+        
+        for i, (text, color) in enumerate(legend_items):
+            item_y = y + 10 + i * 25
+            pygame.draw.line(surface, color, (x + 10, item_y + 10), (x + 40, item_y + 10), 3)
+            pygame.draw.circle(surface, color, (x + 25, item_y + 10), 4)
+            txt_surf = font.render(text, True, (0, 0, 0))
+            surface.blit(txt_surf, (x + 50, item_y))
+
     def replay_and_log(self, steps0, steps1):
         self.log_file.write(f"\n--- New Trajectory Run at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
         
-        num_steps = max(len(steps0), len(steps1))
+        # Group steps by inference step (based on 'noisy' label or order)
+        # Policy 0 (unguided) likely has: [noisy, clean, clean_grad(placeholder)] per step
+        # Policy 1 (guided) likely has: [noisy, clean, clean_grad] per step
+        
+        # Helper to flatten if needed or handle grouping
+        def group_steps(steps_list):
+            grouped = []
+            current_group = []
+            for s in steps_list:
+                # If we see 'noisy', it's the start of a new step (unless it's the very first one)
+                if s['label'] == 'noisy' and current_group:
+                    grouped.append(current_group)
+                    current_group = []
+                current_group.append(s)
+            if current_group:
+                grouped.append(current_group)
+            return grouped
+
+        grouped0 = group_steps(steps0)
+        grouped1 = group_steps(steps1)
+        
+        num_steps = max(len(grouped0), len(grouped1))
         print(f"Replaying {num_steps} denoising steps...")
         
         for i in range(num_steps):
-            s0 = steps0[i] if i < len(steps0) else steps0[-1]
-            s1 = steps1[i] if i < len(steps1) else steps1[-1]
+            g0 = grouped0[i] if i < len(grouped0) else grouped0[-1]
+            g1 = grouped1[i] if i < len(grouped1) else grouped1[-1]
             
-            # Log
-            self.log_step(i, s0, s1)
+            # We want to show the sub-steps "one at a time"
+            # Sub-steps are typically: 0:noisy, 1:clean, 2:clean_grad
             
-            # Render
-            self.screen.fill(self.WHITE)
+            max_sub = max(len(g0), len(g1))
             
-            surf0 = self.maze_bg_surface.copy()
-            surf1 = self.maze_bg_surface.copy()
-            surf2 = self.maze_bg_surface.copy()
+            for sub_idx in range(max_sub):
+                # Get data for this sub-step
+                # If one runs out of sub-steps, hold the last one
+                s0_item = g0[sub_idx] if sub_idx < len(g0) else g0[-1]
+                s1_item = g1[sub_idx] if sub_idx < len(g1) else g1[-1]
+                
+                s0 = s0_item['data']
+                s1 = s1_item['data']
+                label1 = s1_item['label'] # Use guided policy label for display
+                
+                # Log (only log once per full step, or maybe just skip logging detailed sub-steps to file)
+                if sub_idx == 0:
+                    self.log_step(i, s0, s1)
+                
+                # Render
+                self.screen.fill(self.WHITE)
+                
+                surf0 = self.maze_bg_surface.copy()
+                surf1 = self.maze_bg_surface.copy()
+                surf2 = self.maze_bg_surface.copy()
+                
+                # Define standard colors
+                COLOR_NOISY = (180, 180, 180) # Grey
+                COLOR_CLEAN = (0, 200, 0)     # Green
+                COLOR_GRAD = (255, 0, 0)      # Red
+                COLOR_BASE = (0, 0, 255)      # Blue (for baseline panel)
+
+                # Draw Panel 1: MCW=0 (Baseline)
+                # Unguided usually just has noisy->clean. 
+                # We'll show the "current" state in Blue.
+                self.draw_trajectory_on_surface(surf0, s0, COLOR_BASE, f"MCW=0.0 (Step {i}.{sub_idx})")
+                
+                # Draw Panel 2: MCW=Arg (Guided) with specific coloring
+                
+                if label1 == 'noisy':
+                    # Just show noisy state in Grey (or maybe slight Red tint to distinguish from baseline? Let's stick to legend)
+                    self.draw_trajectory_on_surface(surf1, s1, COLOR_NOISY, f"MCW={self.mcw_arg} (Step {i}) - Noisy")
+                elif label1 == 'clean':
+                    # Overlay noisy (Grey, faint) + Clean (Green)
+                    noisy_data = g1[0]['data']
+                    self.draw_trajectory_on_surface(surf1, noisy_data, COLOR_NOISY, width=1)
+                    self.draw_trajectory_on_surface(surf1, s1, COLOR_CLEAN, f"MCW={self.mcw_arg} (Step {i}) - Clean Est")
+                elif label1 == 'clean_grad':
+                     # Overlay noisy (Grey, faint) + Clean (Green, faint) + Clean+Grad (Red)
+                    if len(g1) > 0:
+                        noisy_data = g1[0]['data']
+                        self.draw_trajectory_on_surface(surf1, noisy_data, COLOR_NOISY, width=1)
+                    if len(g1) > 1:
+                        clean_data = g1[1]['data']
+                        self.draw_trajectory_on_surface(surf1, clean_data, COLOR_CLEAN, width=1) # Faint Green logic handles by thin line? Or need alpha? 
+                        # Pygame doesn't do alpha lines easily on existing surface without special handling.
+                        # We will trust width=1 and color distinction.
+                    
+                    self.draw_trajectory_on_surface(surf1, s1, COLOR_GRAD, f"MCW={self.mcw_arg} (Step {i}) - Clean+Grad", width=3)
+                else:
+                    # Fallback
+                    self.draw_trajectory_on_surface(surf1, s1, COLOR_GRAD, f"MCW={self.mcw_arg}")
+
+                
+                # Draw Panel 3: Overlay
+                # Draw s0 faint/Blue
+                self.draw_trajectory_on_surface(surf2, s0, (100, 100, 255))
+                # Draw s1 Red (Clean+Grad)
+                self.draw_trajectory_on_surface(surf2, s1, COLOR_GRAD, "Overlay")
+                
+                # Blit to screen
+                self.screen.blit(surf0, (0, 0))
+                self.screen.blit(surf1, (self.single_w, 0))
+                self.screen.blit(surf2, (self.single_w * 2, 0))
+                
+                # Draw separators
+                pygame.draw.line(self.screen, (0,0,0), (self.single_w, 0), (self.single_w, self.total_h), 2)
+                pygame.draw.line(self.screen, (0,0,0), (self.single_w * 2, 0), (self.single_w * 2, self.total_h), 2)
+                
+                # Draw Legend on Panel 2 (or global)
+                self.draw_legend_box(self.screen, self.single_w + 10, self.total_h - 130)
+
+                pygame.display.flip()
+                
+                if self.args.save_video and not self.args.interactive:
+                    # Capture frame
+                    frame = pygame.surfarray.array3d(self.screen)
+                    frame = frame.transpose([1, 0, 2]) # (w, h, 3) -> (h, w, 3)
+                    self.frames.append(frame)
+                    
+                time.sleep(0.5) # Pause to see sub-step
+                
+                # Handle quit during replay
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        self.running = False
+                        return
             
-            # Draw Panel 1: MCW=0 (Blue)
-            self.draw_trajectory_on_surface(surf0, s0, (0, 0, 255), f"MCW=0.0 (Step {i})")
-            
-            # Draw Panel 2: MCW=Arg (Red)
-            self.draw_trajectory_on_surface(surf1, s1, (255, 0, 0), f"MCW={self.mcw_arg} (Step {i})")
-            
-            # Draw Panel 3: Overlay
-            # Draw s0 faint/Blue
-            self.draw_trajectory_on_surface(surf2, s0, (100, 100, 255))
-            # Draw s1 Red
-            self.draw_trajectory_on_surface(surf2, s1, (255, 0, 0), "Overlay")
-            
-            # Blit to screen
-            self.screen.blit(surf0, (0, 0))
-            self.screen.blit(surf1, (self.single_w, 0))
-            self.screen.blit(surf2, (self.single_w * 2, 0))
-            
-            # Draw separators
-            pygame.draw.line(self.screen, (0,0,0), (self.single_w, 0), (self.single_w, self.total_h), 2)
-            pygame.draw.line(self.screen, (0,0,0), (self.single_w * 2, 0), (self.single_w * 2, self.total_h), 2)
-            
-            pygame.display.flip()
-            time.sleep(0.5) # Pause to see step
-            
-            # Handle quit during replay
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    self.running = False
-                    return
+            # Additional pause after full step
+            time.sleep(0.2)
 
     def log_step(self, step_idx, traj0, traj1):
         # Taking the first trajectory from the batch for logging
@@ -257,9 +364,24 @@ class DenoisingVizEnv(MazeEnv):
                         print("Ready for next click...")
             self.clock.tick(30)
             
+    def save_video(self, filename):
+        if not self.frames:
+            print("No frames to save.")
+            return
+        print(f"Saving video to {filename} ({len(self.frames)} frames)...")
+        try:
+            imageio.mimsave(filename, self.frames, fps=2) # Slow FPS to match visualization pace
+            print("Video saved successfully.")
+        except Exception as e:
+            print(f"Failed to save video: {e}")
+
     def run_non_interactive(self, start_x, start_y):
         start_pos = np.array([start_x, start_y])
         self.run_comparison(start_pos)
+        
+        if self.args.save_video:
+             self.save_video(self.args.save_video)
+             
         # Keep window open? Or quit?
         # Usually test scripts might just finish. 
         # But visualization usually implies waiting to see it.
@@ -286,6 +408,8 @@ def main():
     
     # Inference steps
     parser.add_argument('-ni', '--num_inference_steps', type=int, default=10, help="Number of denoising steps (default: 10)")
+    parser.add_argument('-cg', '--clean_guidance', action='store_true', help="Apply maze cost gradient on estimated clean sample (DPS style) instead of noisy sample")
+    parser.add_argument('-sv', '--save_video', type=str, default=None, help="Filename to save video (mp4) in non-interactive mode")
 
     args = parser.parse_args()
     

@@ -186,7 +186,7 @@ def clamped_barrier_cost_gradient(trajectory: torch.Tensor, segments: torch.Tens
     clamped_grad = torch.clamp(grad, min=-max_value, max=max_value)
     return clamped_grad
 
-def calculate_trajectory_intersection_cost(trajectory, segments, cost_type='fraction', epsilon=1e-6):
+def calculate_trajectory_intersection_cost(trajectory, segments, cost_type='euclidean', alpha=.3, epsilon=1e-6):
     """
     Calculates a cost for trajectory segments that cross maze walls.
     Drives state i+1 towards state i to resolve the intersection.
@@ -268,7 +268,7 @@ def calculate_trajectory_intersection_cost(trajectory, segments, cost_type='frac
         # dist = || B - P || = || B - (A + t(B-A)) || = || (1-t)(B-A) ||
         # squared euclidean is usually cleaner for optimization
         step_len_sq = torch.sum(AB.squeeze(2)**2, dim=-1) # (B, T-1)
-        cost = ((1.0 - t_clamped) ** 2) * step_len_sq
+        cost = ((1.0 - t_clamped) ** 2) * step_len_sq * alpha
         
     elif cost_type == 'fraction':
         # Simply penalize the fraction of the step that is invalid.
@@ -298,6 +298,213 @@ def calculate_trajectory_intersection_cost_gradient(trajectory: torch.Tensor, se
     grad = torch.autograd.grad(cost, trajectory, grad_outputs=torch.ones_like(cost), create_graph=False, retain_graph=False)[0]
     clamped_grad = torch.clamp(grad, min=-max_value, max=max_value)
     return clamped_grad
+
+def calculate_virtual_tail_cost(trajectory, segments, rot_scale=1.0, trans_scale=0, buffer=0.2, epsilon=1e-6):
+    """
+    Calculates a guidance cost by constructing a 'virtual tail'.
+    
+    1. Finds the EARLIEST step i->i+1 that crosses a wall.
+    2. Calculates intersection point P on the wall.
+    3. Adjusts P by 'buffer' distance towards state i to create Pivot Point P_adj.
+    4. Takes the trajectory tail (points i+1 onward).
+    5. Rotates the tail around P_adj to flatten it against the wall (scaled by rot_scale).
+    6. Translates the tail towards state i (scaled by trans_scale).
+    7. Returns MSE between actual tail and virtual tail.
+    
+    Args:
+        trajectory (torch.Tensor): Shape (B, T, 2)
+        segments (torch.Tensor): Shape (N, 4)
+        rot_scale (float): 0.0 to 1.0 (or higher). 1.0 flattens completely parallel to wall.
+        trans_scale (float): Scale factor for moving tail back towards state i.
+        buffer (float): Distance to shift the intersection point back towards the safe state i.
+        
+    Returns:
+        loss (torch.Tensor): Shape (B,). Scalar cost per trajectory.
+    """
+    batch_size, num_steps, _ = trajectory.shape
+    device = trajectory.device
+    
+    # --- 1. Find Intersections (Vectorized) ---
+    # A = State i, B = State i+1
+    A = trajectory[:, :-1, :].unsqueeze(2) # (B, T-1, 1, 2)
+    B = trajectory[:, 1:, :].unsqueeze(2)  # (B, T-1, 1, 2)
+    
+    # C = Wall Start, D = Wall End
+    C = segments[:, :2].view(1, 1, -1, 2)  # (1, 1, N, 2)
+    D = segments[:, 2:].view(1, 1, -1, 2)  # (1, 1, N, 2)
+
+    AB = B - A
+    CD = D - C
+    AC = C - A
+
+    def cross_2d(v1, v2):
+        return v1[..., 0] * v2[..., 1] - v1[..., 1] * v2[..., 0]
+
+    denom = cross_2d(AB, CD)
+    denom = torch.where(torch.abs(denom) < epsilon, torch.tensor(epsilon, device=device), denom)
+
+    # t: fraction along Trajectory AB (0 to 1)
+    t = cross_2d(AC, CD) / denom
+    # u: fraction along Wall CD (0 to 1)
+    u = cross_2d(AC, AB) / denom
+
+    # Valid intersection: t in [0,1], u in [0,1]
+    valid_mask = (t >= -epsilon) & (t <= 1.0 + epsilon) & (u >= -epsilon) & (u <= 1.0 + epsilon)
+    
+    # --- 2. Process Each Trajectory in Batch ---
+    # (Looping over batch is safer for complex geometric reconstruction per item)
+    
+    batch_losses = []
+    
+    for b in range(batch_size):
+        # Filter collisions for this trajectory
+        # t_vals: (T-1, N)
+        t_vals = t[b]
+        mask = valid_mask[b]
+        
+        # We need the EARLIEST step (smallest step index i) that has ANY collision.
+        # Check if any wall is hit at each step
+        step_hits_wall = torch.any(mask, dim=1) # (T-1,)
+        
+        # Get indices of steps that hit walls
+        hit_indices = torch.nonzero(step_hits_wall, as_tuple=True)[0]
+        
+        if len(hit_indices) == 0:
+            # No collision, zero loss
+            batch_losses.append(torch.tensor(0.0, device=device, requires_grad=True))
+            continue
+            
+        # Earliest collision step index
+        i = hit_indices[0]
+        
+        # Within this step, find the wall that was hit earliest (smallest t)
+        # mask[i] is shape (N,)
+        valid_t_in_step = torch.where(mask[i], t_vals[i], torch.tensor(float('inf'), device=device))
+        best_t, wall_idx = torch.min(valid_t_in_step, dim=0)
+        
+        # Ensure best_t is usable (clamp for numerical safety)
+        best_t = torch.clamp(best_t, 0.0, 1.0)
+        
+        # --- 3. Construct Virtual Tail ---
+        
+        # Data for calculation (detached, so we don't backprop through the TARGET construction)
+        # We want to pull the ACTIVE trajectory towards a FIXED target.
+        curr_traj_tail = trajectory[b, i+1:, :] # Shape (Len_Tail, 2) - This has gradients!
+        
+        with torch.no_grad():
+            s_i = trajectory[b, i, :]
+            s_next = trajectory[b, i+1, :]
+            
+            # Intersection Point P
+            # P = A + t * AB
+            vec_step = s_next - s_i
+            step_len = torch.norm(vec_step)
+            
+            # Safe normalization
+            if step_len > epsilon:
+                step_dir = vec_step / step_len
+            else:
+                step_dir = torch.zeros_like(vec_step)
+                
+            # Distance from s_i to intersection
+            dist_to_int = best_t * step_len
+            
+            # Clamp distance so it doesn't go negative (past s_i)
+            # This ensures p_adj is between s_i and the intersection point
+            dist_adj = torch.clamp(dist_to_int - buffer, min=0.0)
+            
+            # Adjusted Pivot Point
+            p_adj = s_i + step_dir * dist_adj
+            
+            # Wall Vector W
+            w_start = segments[wall_idx, :2]
+            w_end = segments[wall_idx, 2:]
+            vec_wall = w_end - w_start
+            
+            # Vector from Adjusted Pivot to S_{i+1} 
+            # (Basically represents the part of the step considered 'invalid' or 'penetrating' relative to the buffer)
+            vec_penetration = s_next - p_adj
+            
+            # --- Rotation Logic ---
+            # Angle of penetration vector
+            angle_pen = torch.atan2(vec_penetration[1], vec_penetration[0])
+            
+            # Angle of wall vector
+            angle_wall = torch.atan2(vec_wall[1], vec_wall[0])
+            
+            # We have two wall directions: angle_wall and angle_wall + pi.
+            # We want the one that makes the SMALLER angle with the penetration vector.
+            # Diff 1
+            d1 = (angle_pen - angle_wall + np.pi) % (2*np.pi) - np.pi
+            # Diff 2 (opposite direction)
+            angle_wall_opp = angle_wall + np.pi
+            d2 = (angle_pen - angle_wall_opp + np.pi) % (2*np.pi) - np.pi
+            
+            if torch.abs(d1) < torch.abs(d2):
+                delta_angle = d1
+            else:
+                delta_angle = d2
+            
+            # Target rotation: We want to reduce this delta by rot_scale.
+            # If we rotate the vector by -delta, it aligns with wall.
+            rotation_angle = -delta_angle * rot_scale
+            
+            # Create Rotation Matrix
+            c = torch.cos(rotation_angle)
+            s = torch.sin(rotation_angle)
+            R = torch.tensor([[c, -s], [s, c]], device=device)
+            
+            # --- Apply Rotation to whole tail ---
+            # Center tail at P_adj
+            tail_centered = curr_traj_tail.detach() - p_adj
+            # Rotate: (N, 2) @ (2, 2) -> (N, 2)
+            # Need transpose for matmul: (R @ v.T).T = v @ R.T
+            tail_rotated = torch.matmul(tail_centered, R.T)
+            
+            # --- Translation Logic ---
+            # Move closer to state i.
+            # Direction: From P_adj towards S_i (which is -step_dir)
+            vec_back = s_i - p_adj
+            if torch.norm(vec_back) > epsilon:
+                dir_back = vec_back / torch.norm(vec_back)
+            else:
+                dir_back = torch.zeros_like(vec_back)
+                
+            # Magnitude: scaled multiple of length of line segment (P_adj to S_{i+1})
+            len_segment = torch.norm(vec_penetration)
+            translation = dir_back * len_segment * trans_scale
+            
+            # --- Final Virtual Target ---
+            virtual_tail = tail_rotated + p_adj + translation
+        
+        # --- 4. Compute Loss ---
+        # MSE between Actual Tail (with grads) and Virtual Tail (detached)
+        loss = torch.nn.functional.mse_loss(curr_traj_tail, virtual_tail)
+        batch_losses.append(loss)
+        
+    return torch.stack(batch_losses)
+
+def calculate_virtual_tail_cost_gradient(trajectory: torch.Tensor, segments: torch.Tensor, epsilon: float = 1e-6, max_value: float = 1000.0) -> torch.Tensor:
+    """
+    Calculates the gradient of the virtual tail cost for a batch of trajectories against maze walls.
+    
+    Args:
+        trajectory (torch.Tensor): Shape (B, T, 2) where last dim is (x, y).
+        segments (torch.Tensor): Shape (N, 4) where last dim is (x1, y1, x2, y2).
+        epsilon (float): Small value to prevent log(0).
+    """
+    cost = calculate_virtual_tail_cost(trajectory, segments, epsilon=epsilon)
+    grad = torch.autograd.grad(cost, trajectory, grad_outputs=torch.ones_like(cost), create_graph=False, retain_graph=False, allow_unused=True)[0]
+    if grad is None:
+        grad = torch.zeros_like(trajectory)
+    clamped_grad = torch.clamp(grad, min=-max_value, max=max_value)
+    return clamped_grad
+
+def calculate_combo_trajectory_intersection_and_virtual_tail_cost_gradient(trajectory: torch.Tensor, segments: torch.Tensor, epsilon: float = 1e-6, max_value: float = 1000.0) -> torch.Tensor:
+    intersection_grad = calculate_trajectory_intersection_cost_gradient(trajectory, segments, epsilon=epsilon, max_value=max_value)
+    virtual_tail_grad = calculate_virtual_tail_cost_gradient(trajectory, segments, epsilon=epsilon, max_value=max_value)
+    return intersection_grad + virtual_tail_grad
+
 
 def plot_barrier_heatmap(maze, segments_tensor, resolution=20):
     """

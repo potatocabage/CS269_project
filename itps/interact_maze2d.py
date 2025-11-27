@@ -282,7 +282,7 @@ class MazeEnv:
         self.screen.blit(label_max, (bar_x + bar_w + 10, bar_y))
         self.screen.blit(label_min, (bar_x + bar_w + 10, bar_y + bar_h - 10))
 
-    def update_screen(self, xy_pred=None, collisions=None, scores=None, keep_drawing=False, traj_in_gui_space=False):
+    def update_screen(self, xy_pred=None, collisions=None, scores=None, keep_drawing=False, traj_in_gui_space=False, **kwargs):
         self.draw_maze_background()
         
         # Draw cost overlay
@@ -344,7 +344,7 @@ class MazeEnv:
 
 class UnconditionalMaze(MazeEnv):
     # for dragging the agent around to explore motion manifold
-    def __init__(self, policy, policy_tag=None, maze_cost_weight=0.0):
+    def __init__(self, policy, policy_tag=None, maze_cost_weight=0.0, clean_guidance=False):
         super().__init__()
         self.mouse_pos = None
         self.agent_in_collision = False
@@ -355,7 +355,7 @@ class UnconditionalMaze(MazeEnv):
         if policy is not None and policy_tag == 'dp' and hasattr(policy, 'diffusion'):
             device = get_device_from_parameters(policy) if policy is not None else torch.device("cpu")
             maze_tensor = torch.from_numpy(self.maze.astype(float)).float().to(device)
-            policy.diffusion.set_maze(maze_tensor, cost_weight=maze_cost_weight)
+            policy.diffusion.set_maze(maze_tensor, cost_weight=maze_cost_weight, apply_on_clean=clean_guidance)
 
     def infer_target(self, guide=None, visualizer=None):
         agent_hist_xy = self.agent_history_xy[-1] 
@@ -419,8 +419,8 @@ class UnconditionalMaze(MazeEnv):
 
 class ConditionalMaze(UnconditionalMaze):
     # for interactive guidance dataset collection
-    def __init__(self, policy, vis_dp_dynamics=False, savepath=None, alignment_strategy=None, policy_tag=None, maze_cost_weight=0.0):
-        super().__init__(policy, policy_tag=policy_tag, maze_cost_weight=maze_cost_weight)
+    def __init__(self, policy, vis_dp_dynamics=False, savepath=None, alignment_strategy=None, policy_tag=None, maze_cost_weight=0.0, clean_guidance=False):
+        super().__init__(policy, policy_tag=policy_tag, maze_cost_weight=maze_cost_weight, clean_guidance=clean_guidance)
         self.drawing = False
         self.keep_drawing = False
         self.vis_dp_dynamics = vis_dp_dynamics
@@ -505,8 +505,8 @@ class ConditionalMaze(UnconditionalMaze):
 
 class MazeExp(ConditionalMaze):
     # for replaying the trials and benchmarking the alignment strategies
-    def __init__(self, policy, vis_dp_dynamics=False, savepath=None, alignment_strategy=None, policy_tag=None, loadpath=None, maze_cost_weight=0.0):
-        super().__init__(policy, vis_dp_dynamics, savepath, alignment_strategy, policy_tag=policy_tag, maze_cost_weight=maze_cost_weight)
+    def __init__(self, policy, vis_dp_dynamics=False, savepath=None, alignment_strategy=None, policy_tag=None, loadpath=None, maze_cost_weight=0.0, clean_guidance=False):
+        super().__init__(policy, vis_dp_dynamics, savepath, alignment_strategy, policy_tag=policy_tag, maze_cost_weight=maze_cost_weight, clean_guidance=clean_guidance)
         # Load saved trails
         assert loadpath is not None
         with open(loadpath, "r", buffering=1) as file:
@@ -615,6 +615,7 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--savepath', type=str, default=None, help="Filename to save the drawing")
     parser.add_argument('-l', '--loadpath', type=str, default=None, help="Filename to load the drawing")
     parser.add_argument('-mcw', '--maze_cost_weight', type=float, default=0.0, help="Weight for maze wall cost function in reverse diffusion (0.0 = disabled)")
+    parser.add_argument('-cg', '--clean_guidance', action='store_true', help="Apply maze cost gradient on estimated clean sample (DPS style) instead of noisy sample")
 
     args = parser.parse_args()
 
@@ -683,7 +684,7 @@ if __name__ == "__main__":
         policy_tag = None
 
     if args.unconditional:
-        interactiveMaze = UnconditionalMaze(policy, policy_tag=policy_tag, maze_cost_weight=args.maze_cost_weight)
+        interactiveMaze = UnconditionalMaze(policy, policy_tag=policy_tag, maze_cost_weight=args.maze_cost_weight, clean_guidance=args.clean_guidance)
     elif args.loadpath is not None:
         if args.savepath is None:
             savepath = None
@@ -698,7 +699,7 @@ if __name__ == "__main__":
             elif alignment_strategy == 'stochastic-sampling':
                 alignment_tag = 'ss'
             savepath = f"{args.loadpath[:-5]}_{policy_tag}_{alignment_tag}{args.savepath}"
-        interactiveMaze = MazeExp(policy, args.vis_dp_dynamics, savepath, alignment_strategy, policy_tag=policy_tag, loadpath=args.loadpath, maze_cost_weight=args.maze_cost_weight)
+        interactiveMaze = MazeExp(policy, args.vis_dp_dynamics, savepath, alignment_strategy, policy_tag=policy_tag, loadpath=args.loadpath, maze_cost_weight=args.maze_cost_weight, clean_guidance=args.clean_guidance)
     else:
-        interactiveMaze = ConditionalMaze(policy, args.vis_dp_dynamics, args.savepath, alignment_strategy, policy_tag=policy_tag, maze_cost_weight=args.maze_cost_weight)
+        interactiveMaze = ConditionalMaze(policy, args.vis_dp_dynamics, args.savepath, alignment_strategy, policy_tag=policy_tag, maze_cost_weight=args.maze_cost_weight, clean_guidance=args.clean_guidance)
     interactiveMaze.run()

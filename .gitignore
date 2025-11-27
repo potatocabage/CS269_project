@@ -6,3 +6,4 @@ itps/weights_*.zip
 .vscode
 *__pycache__*
 *.log
+*.mp4
