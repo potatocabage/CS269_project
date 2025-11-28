@@ -37,15 +37,30 @@ class DenoisingVizEnv(MazeEnv):
         # MazeEnv sets window_size in __init__. We must let it run, then modify.
         super().__init__()
         
+        # Allow optional override of GUI panel size via CLI args
+        # (keep aspect ratio if only width is provided)
+        if getattr(args, 'gui_w', None) is not None:
+            gw = int(args.gui_w)
+            if getattr(args, 'gui_h', None) is None:
+                # preserve aspect ratio
+                aspect = float(self.gui_size[1]) / float(self.gui_size[0])
+                gh = int(gw * aspect)
+            else:
+                gh = int(args.gui_h)
+            self.gui_size = (gw, gh)
+
         self.policy = policy
         self.args = args
         self.mcw_arg = args.maze_cost_weight
         
-        # Setup display for 3 panels
+        # Setup display for 3 panels and a legend area below
         self.single_w, self.single_h = self.gui_size
         self.total_w = self.single_w * 3
-        self.total_h = self.single_h
-        
+        # Legend area size (proportional to panel height)
+        self.legend_h = int(max(64, self.single_h * 0.22))
+        self.legend_margin = int(max(8, self.single_h * 0.04))
+        self.total_h = self.single_h + self.legend_h + self.legend_margin
+
         self.window_size = (self.total_w, self.total_h)
         self.screen = pygame.display.set_mode(self.window_size)
         pygame.display.set_caption("Denoising Visualization: MCW=0 vs MCW={}".format(self.mcw_arg))
@@ -54,7 +69,17 @@ class DenoisingVizEnv(MazeEnv):
         self.maze_bg_surface = pygame.Surface(self.gui_size)
         self.draw_maze_background_to_surface(self.maze_bg_surface)
         
-        self.font = pygame.font.SysFont(None, 36)
+        # Scale fonts relative to GUI panel height so labels and legend fit small windows
+        base_h = max(100, self.gui_size[1])
+        main_font_size = max(12, int(base_h * 0.08))
+        title_font_size = max(12, int(base_h * 0.06))
+        legend_font_size = max(10, int(base_h * 0.045))
+        label_font_size = max(10, int(base_h * 0.05))
+
+        self.font = pygame.font.SysFont(None, main_font_size)
+        self.title_font = pygame.font.SysFont(None, title_font_size)
+        self.legend_font = pygame.font.SysFont(None, legend_font_size)
+        self.label_font = pygame.font.SysFont(None, label_font_size)
         
         # Setup logging
         self.log_file = open("denoising_log.log", "w")
@@ -95,8 +120,8 @@ class DenoisingVizEnv(MazeEnv):
         pygame.draw.circle(surface, self.agent_color, (int(self.agent_gui_pos[0]), int(self.agent_gui_pos[1])), 10)
         
         if label:
-            text_surf = self.font.render(label, True, (0, 0, 0))
-            surface.blit(text_surf, (10, 10))
+            text_surf = self.label_font.render(label, True, (0, 0, 0))
+            surface.blit(text_surf, (6, 6))
 
     def run_comparison(self, start_gui_pos):
         self.update_agent_pos(start_gui_pos)
@@ -155,24 +180,32 @@ class DenoisingVizEnv(MazeEnv):
 
     def draw_legend_box(self, surface, x, y):
         # Draw a legend for the trajectory types
-        font = pygame.font.SysFont(None, 24)
+        font = self.legend_font
         legend_items = [
             ("Noisy", (200, 200, 200)), # Grey
             ("Clean Est", (0, 255, 0)), # Green
             ("Clean+Grad", (255, 0, 0)), # Red
             ("Baseline", (0, 0, 255)) # Blue (for left panel)
         ]
-        
-        box_w, box_h = 160, 110
+        # Size legend relative to single panel size
+        box_w = int(self.single_w * 0.48)
+        box_h = int(self.single_h * 0.22)
+        box_w = max(120, box_w)
+        box_h = max(80, box_h)
+
         pygame.draw.rect(surface, (255, 255, 255), (x, y, box_w, box_h))
         pygame.draw.rect(surface, (0, 0, 0), (x, y, box_w, box_h), 1)
-        
+
+        padding_x = int(box_w * 0.06)
+        padding_y = int(box_h * 0.12)
+        line_y_step = int((box_h - padding_y * 2) / len(legend_items))
+
         for i, (text, color) in enumerate(legend_items):
-            item_y = y + 10 + i * 25
-            pygame.draw.line(surface, color, (x + 10, item_y + 10), (x + 40, item_y + 10), 3)
-            pygame.draw.circle(surface, color, (x + 25, item_y + 10), 4)
+            item_y = y + padding_y + i * line_y_step
+            pygame.draw.line(surface, color, (x + padding_x, item_y + 6), (x + padding_x + 40, item_y + 6), 3)
+            pygame.draw.circle(surface, color, (x + padding_x + 20, item_y + 6), max(3, int(box_h * 0.03)))
             txt_surf = font.render(text, True, (0, 0, 0))
-            surface.blit(txt_surf, (x + 50, item_y))
+            surface.blit(txt_surf, (x + padding_x + 50, item_y))
 
     def replay_and_log(self, steps0, steps1):
         self.log_file.write(f"\n--- New Trajectory Run at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
@@ -275,17 +308,19 @@ class DenoisingVizEnv(MazeEnv):
                 # Draw s1 Red (Clean+Grad)
                 self.draw_trajectory_on_surface(surf2, s1, COLOR_GRAD, "Overlay")
                 
-                # Blit to screen
+                # Blit to screen (panels occupy the top region)
                 self.screen.blit(surf0, (0, 0))
                 self.screen.blit(surf1, (self.single_w, 0))
                 self.screen.blit(surf2, (self.single_w * 2, 0))
-                
-                # Draw separators
-                pygame.draw.line(self.screen, (0,0,0), (self.single_w, 0), (self.single_w, self.total_h), 2)
-                pygame.draw.line(self.screen, (0,0,0), (self.single_w * 2, 0), (self.single_w * 2, self.total_h), 2)
-                
-                # Draw Legend on Panel 2 (or global)
-                self.draw_legend_box(self.screen, self.single_w + 10, self.total_h - 130)
+
+                # Draw separators only across the panel height (not legend area)
+                pygame.draw.line(self.screen, (0,0,0), (self.single_w, 0), (self.single_w, self.single_h), 2)
+                pygame.draw.line(self.screen, (0,0,0), (self.single_w * 2, 0), (self.single_w * 2, self.single_h), 2)
+
+                # Draw Legend below the panels (centered under middle panel)
+                legend_x = self.single_w + int(self.single_w * 0.05)
+                legend_y = self.single_h + self.legend_margin
+                self.draw_legend_box(self.screen, legend_x, legend_y)
 
                 pygame.display.flip()
                 
@@ -342,13 +377,19 @@ class DenoisingVizEnv(MazeEnv):
         self.screen.blit(self.maze_bg_surface, (0, 0))
         self.screen.blit(self.maze_bg_surface, (self.single_w, 0))
         self.screen.blit(self.maze_bg_surface, (self.single_w * 2, 0))
-        
-        # Draw separators
-        pygame.draw.line(self.screen, (0,0,0), (self.single_w, 0), (self.single_w, self.total_h), 2)
-        pygame.draw.line(self.screen, (0,0,0), (self.single_w * 2, 0), (self.single_w * 2, self.total_h), 2)
-        
-        txt = self.font.render("Click on LEFT panel to set start pos", True, (0,0,0))
+
+        # Draw separators only across panels
+        pygame.draw.line(self.screen, (0,0,0), (self.single_w, 0), (self.single_w, self.single_h), 2)
+        pygame.draw.line(self.screen, (0,0,0), (self.single_w * 2, 0), (self.single_w * 2, self.single_h), 2)
+
+        # Instruction text (top area)
+        txt = self.title_font.render("Click on LEFT panel to set start pos", True, (0,0,0))
         self.screen.blit(txt, (50, 50))
+
+        # Draw an initial legend below panels so user sees it immediately
+        legend_x = self.single_w + int(self.single_w * 0.05)
+        legend_y = self.single_h + self.legend_margin
+        self.draw_legend_box(self.screen, legend_x, legend_y)
         pygame.display.flip()
         
         while self.running:
@@ -410,11 +451,20 @@ def main():
     parser.add_argument('-ni', '--num_inference_steps', type=int, default=10, help="Number of denoising steps (default: 10)")
     parser.add_argument('-cg', '--clean_guidance', action='store_true', help="Apply maze cost gradient on estimated clean sample (DPS style) instead of noisy sample")
     parser.add_argument('-sv', '--save_video', type=str, default=None, help="Filename to save video (mp4) in non-interactive mode")
+    # Optional GUI size override (useful to make window smaller/larger)
+    parser.add_argument('--gui_w', type=int, default=None, help="Optional GUI panel width in pixels (overrides default)")
+    parser.add_argument('--gui_h', type=int, default=None, help="Optional GUI panel height in pixels (overrides default). If omitted, aspect ratio is preserved.")
 
     args = parser.parse_args()
     
     # Load Policy
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Prefer CUDA, then Apple's Metal (MPS) if available, otherwise CPU
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Using device: {device}")
     
     if args.policy in ["diffusion", "dp"]:
