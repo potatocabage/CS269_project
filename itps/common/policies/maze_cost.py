@@ -554,7 +554,7 @@ def calculate_combo_trajectory_intersection_and_virtual_tail_cost_gradient(traje
 def calculate_combo_virtual_tail_and_self_overlap_cost_gradient(
     trajectory: torch.Tensor,
     segments: torch.Tensor,
-    min_separation: float = 0.1,
+    min_separation: float = 0.2,
     ignore_nearby: int = 2,
     alpha: float = 10.0,
     epsilon: float = 1e-6,
