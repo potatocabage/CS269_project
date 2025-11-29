@@ -484,6 +484,41 @@ def calculate_virtual_tail_cost(trajectory, segments, rot_scale=1.0, trans_scale
         
     return torch.stack(batch_losses)
 
+def calculate_self_overlap_cost(trajectory: torch.Tensor, min_separation: float, ignore_nearby: int, alpha: float):
+    """
+    Penalize trajectory self-overlap/looping by applying a soft penalty when non-adjacent
+    points come within `min_separation` of each other.
+
+    Args:
+        trajectory: (B, T, 2)
+        min_separation: distance threshold in same units as trajectory (unnormalized)
+        ignore_nearby: ignore pairs with |i-j| <= ignore_nearby (adjacent steps)
+        alpha: sharpness for sigmoid or hinge
+    Returns:
+        per-step cost (B, T) or per-trajectory (B,) depending preference. We'll return per-step sum.
+    """
+    B, T, _ = trajectory.shape
+    # pairwise distances: (B, T, T)
+    diff = trajectory.unsqueeze(2) - trajectory.unsqueeze(1)  # (B, T, T, 2)
+    dist = torch.norm(diff, dim=-1)  # (B, T, T)
+
+    # build mask to exclude self and nearby indices
+    idxs = torch.arange(T, device=trajectory.device)
+    i = idxs.view(-1, 1)
+    j = idxs.view(1, -1)
+    mask = (torch.abs(i - j) > ignore_nearby).float()  # (T, T)
+
+    # Compute soft hinge: cost = softplus(min_separation - dist)
+    # Optionally scale with alpha: softplus(alpha * (min_sep - d)) / alpha
+    inv = torch.nn.functional.softplus(alpha * (min_separation - dist)) / alpha  # (B, T, T)
+    # zero out excluded pairs
+    inv = inv * mask.unsqueeze(0)
+
+    # Sum pairwise costs per point or per trajectory.
+    per_point_cost = torch.sum(inv, dim=2)  # (B, T) -> cost for each point (sum over other points)
+    # Option: average or clamp
+    return per_point_cost
+
 def calculate_virtual_tail_cost_gradient(trajectory: torch.Tensor, segments: torch.Tensor, epsilon: float = 1e-6, max_value: float = 1000.0) -> torch.Tensor:
     """
     Calculates the gradient of the virtual tail cost for a batch of trajectories against maze walls.
@@ -500,10 +535,56 @@ def calculate_virtual_tail_cost_gradient(trajectory: torch.Tensor, segments: tor
     clamped_grad = torch.clamp(grad, min=-max_value, max=max_value)
     return clamped_grad
 
+def calculate_self_overlap_cost_gradient(trajectory: torch.Tensor, min_separation: float = 1.0, ignore_nearby: int = 2, alpha: float = 10.0, max_value: float = 1000.0) -> torch.Tensor:
+    cost = calculate_self_overlap_cost(trajectory, min_separation=min_separation, ignore_nearby=ignore_nearby, alpha=alpha)
+    # sum cost over time to get scalar per batch element
+    cost_scalar = cost.mean(dim=1)  # (B,)
+    grad = torch.autograd.grad(cost_scalar, trajectory, grad_outputs=torch.ones_like(cost_scalar), create_graph=False, retain_graph=False, allow_unused=False)[0]
+    if grad is None:
+        return torch.zeros_like(trajectory)
+    return torch.clamp(grad, min=-max_value, max=max_value)
+
+
 def calculate_combo_trajectory_intersection_and_virtual_tail_cost_gradient(trajectory: torch.Tensor, segments: torch.Tensor, epsilon: float = 1e-6, max_value: float = 1000.0) -> torch.Tensor:
     intersection_grad = calculate_trajectory_intersection_cost_gradient(trajectory, segments, epsilon=epsilon, max_value=max_value)
     virtual_tail_grad = calculate_virtual_tail_cost_gradient(trajectory, segments, epsilon=epsilon, max_value=max_value)
     return intersection_grad + virtual_tail_grad
+
+
+def calculate_combo_virtual_tail_and_self_overlap_cost_gradient(
+    trajectory: torch.Tensor,
+    segments: torch.Tensor,
+    min_separation: float = 0.1,
+    ignore_nearby: int = 2,
+    alpha: float = 10.0,
+    epsilon: float = 1e-6,
+    max_value: float = 1000.0,
+    virtual_weight: float = 1.0,
+    self_weight: float = 0.1,
+) -> torch.Tensor:
+    """
+    Combine the gradients from the virtual-tail cost and the self-overlap cost.
+
+    This helper computes each component's gradient (already clamped by their
+    respective helpers) and returns a weighted sum, clamped to `[-max_value, max_value]`.
+
+    Args:
+        trajectory: (B, T, 2) trajectory tensor requiring gradients.
+        segments: (N, 4) maze segments tensor (used by virtual-tail cost).
+        min_separation, ignore_nearby, alpha: parameters forwarded to self-overlap cost.
+        epsilon: numerical stability forwarded to the virtual-tail component.
+        max_value: final gradient clamp magnitude.
+        virtual_weight: scalar weight for the virtual-tail gradient.
+        self_weight: scalar weight for the self-overlap gradient.
+
+    Returns:
+        grad: (B, T, 2) combined gradient tensor clamped to [-max_value, max_value].
+    """
+    virtual_grad = calculate_virtual_tail_cost_gradient(trajectory, segments, epsilon=epsilon, max_value=max_value)
+    self_grad = calculate_self_overlap_cost_gradient(trajectory, min_separation=min_separation, ignore_nearby=ignore_nearby, alpha=alpha, max_value=max_value)
+
+    combined = virtual_weight * virtual_grad + self_weight * self_grad
+    return torch.clamp(combined, min=-max_value, max=max_value)
 
 
 def plot_barrier_heatmap(maze, segments_tensor, resolution=20):

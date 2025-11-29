@@ -65,9 +65,13 @@ class DenoisingVizEnv(MazeEnv):
         self.screen = pygame.display.set_mode(self.window_size)
         pygame.display.set_caption("Denoising Visualization: MCW=0 vs MCW={}".format(self.mcw_arg))
         
-        # Pre-render maze background to a surface
+        # Pre-render maze background to a surface (current maze)
         self.maze_bg_surface = pygame.Surface(self.gui_size)
         self.draw_maze_background_to_surface(self.maze_bg_surface)
+        # Also pre-render the original/old maze so we can show it in the leftmost panel
+        self.old_maze_bg_surface = pygame.Surface(self.gui_size)
+        # Use a helper that accepts an explicit maze array
+        self.draw_maze_background_to_surface(self.old_maze_bg_surface, maze_array=getattr(self, 'old_maze', None))
         
         # Scale fonts relative to GUI panel height so labels and legend fit small windows
         base_h = max(100, self.gui_size[1])
@@ -93,8 +97,11 @@ class DenoisingVizEnv(MazeEnv):
         # Override batch size to 1 for this visualization
         self.batch_size = 1
         
-    def draw_maze_background_to_surface(self, surface):
-        maze_img = pygame.surfarray.make_surface(255 - np.swapaxes(np.repeat(self.maze[:, :, np.newaxis] * 255, 3, axis=2).astype(np.uint8), 0, 1))
+    def draw_maze_background_to_surface(self, surface, maze_array=None):
+        """Render a maze array (or self.maze by default) onto `surface` scaled to GUI size."""
+        if maze_array is None:
+            maze_array = self.maze
+        maze_img = pygame.surfarray.make_surface(255 - np.swapaxes(np.repeat(maze_array[:, :, np.newaxis] * 255, 3, axis=2).astype(np.uint8), 0, 1))
         maze_img = pygame.transform.scale(maze_img, self.gui_size)
         surface.blit(maze_img, (0, 0))
 
@@ -160,7 +167,8 @@ class DenoisingVizEnv(MazeEnv):
              agent_hist_xy = np.repeat(agent_hist_xy, n_obs_steps, axis=0)
         
         device = get_device_from_parameters(self.policy)
-        device_type = "cuda" if device.type == "cuda" else "cpu"
+        # Support CUDA and Apple MPS devices for autocast selection
+        device_type = device.type if device.type in ("cuda", "mps") else "cpu"
         
         # Prepare observation
         obs = einops.repeat(
@@ -260,7 +268,8 @@ class DenoisingVizEnv(MazeEnv):
                 # Render
                 self.screen.fill(self.WHITE)
                 
-                surf0 = self.maze_bg_surface.copy()
+                # Leftmost panel should show the original/old maze
+                surf0 = self.old_maze_bg_surface.copy()
                 surf1 = self.maze_bg_surface.copy()
                 surf2 = self.maze_bg_surface.copy()
                 
@@ -372,9 +381,9 @@ class DenoisingVizEnv(MazeEnv):
     def run_interactive(self):
         print("Interactive Mode: Click on the maze to set start position.")
         
-        # Initial draw
+        # Initial draw: leftmost panel shows the old maze
         self.screen.fill(self.WHITE)
-        self.screen.blit(self.maze_bg_surface, (0, 0))
+        self.screen.blit(self.old_maze_bg_surface, (0, 0))
         self.screen.blit(self.maze_bg_surface, (self.single_w, 0))
         self.screen.blit(self.maze_bg_surface, (self.single_w * 2, 0))
 

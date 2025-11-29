@@ -41,6 +41,8 @@ from common.policies.utils import (
 )
 import time
 from common.policies.maze_cost import (
+    calculate_self_overlap_cost_gradient,
+    calculate_combo_virtual_tail_and_self_overlap_cost_gradient,
     get_maze_segments,
     calculate_maze_barrier_cost,
     clamped_barrier_cost_gradient,
@@ -338,7 +340,7 @@ class DiffusionModel(nn.Module):
             # naction.detach()
         return grad
     
-    def maze_wall_cost_gradient(self, naction_normalized, normalizer=None, cost_type='virtual_tail'):
+    def maze_wall_cost_gradient(self, naction_normalized, normalizer=None, cost_type='combo_virtual_tail_and_self_overlap'):
         """
         Compute gradient of maze wall cost function.
         
@@ -391,6 +393,10 @@ class DiffusionModel(nn.Module):
                 grad = calculate_virtual_tail_cost_gradient(naction_unnorm, self.maze_segments)
             elif cost_type == 'combo':
                 grad = calculate_combo_trajectory_intersection_and_virtual_tail_cost_gradient(naction_unnorm, self.maze_segments)
+            elif cost_type == 'self_overlap':
+                grad = calculate_self_overlap_cost_gradient(naction_unnorm)
+            elif cost_type == 'combo_virtual_tail_and_self_overlap':
+                grad = calculate_combo_virtual_tail_and_self_overlap_cost_gradient(naction_unnorm, self.maze_segments)
             else:
                 raise ValueError(f"Unknown cost type: {cost_type}")
             
