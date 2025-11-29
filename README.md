@@ -55,6 +55,34 @@ python interact_maze2d.py -p [act, dp] [-bi, -gd, -ss] -v
 |---------------------------|
 |![](media/ss_dynamics.gif)|
 
+## Denoising / Guidance Visualization
+
+A dedicated visualizer `itps/test_denoising_viz.py` shows the DDIM/DDPM denoising steps and the effect of maze-cost guidance (noisy sample, estimated clean sample, and gradient-adjusted sample). You can also resize the GUI panels for smaller or larger displays.
+
+Basic usage:
+```
+python itps/test_denoising_viz.py -p diffusion -mcw 10.0 -cg
+```
+
+Override the per-panel GUI width/height with `--gui_w` and `--gui_h` (pixels). The script displays three side-by-side panels, so the total window width is `3 * gui_w` and the legend is shown below the panels.
+
+Examples:
+
+- Set each panel to 320×240:
+```
+python itps/test_denoising_viz.py -p diffusion -mcw 10.0 -cg --gui_w 320 --gui_h 240
+```
+
+- Set width only (height preserves original aspect ratio):
+```
+python itps/test_denoising_viz.py -p diffusion -mcw 10.0 -cg --gui_w 320
+```
+
+Notes:
+- If you choose a very small `--gui_w`, UI elements (fonts, legend) are automatically scaled down to fit, but extremely small sizes may still be hard to read.
+- The script prefers GPU `cuda` if available, otherwise `mps` (Apple Metal) on macOS, and falls back to CPU.
+
+
 ## Benchmark methods.
 Save sketches into a file `exp00.json` and use them across methods.
 ```
