@@ -9,6 +9,7 @@ from torch import Tensor
 
 from common.policies.policy_protocol import Policy
 from common.policies.utils import get_device_from_parameters
+from common.utils.obstacles import torch_sdf_penalty
 
 
 class PolicyRolloutWrapper:
@@ -81,6 +82,8 @@ class PolicyRolloutWrapper:
             # Store a mapping from action timestamp (the moment the policy intends for the action to be)
             # executed.
             self._action_cache: dict[int, Tensor] = {}
+            # Store the last computed obstacle penalties for actions (timestamp -> penalty scalar)
+            self._last_obstacle_penalties: dict[int, float] = {}
 
     def invalidate_action_cache(self):
         with self._thread_lock:
@@ -144,6 +147,29 @@ class PolicyRolloutWrapper:
         }
         actions = self.policy.run_inference(observation_sequence_batch, guide=guide, visualizer=visualizer).cpu()  # (batch, seq, action_dim)
 
+        # Optionally compute obstacle penalties for the returned action sequences and stash them
+        try:
+            if visualizer is not None and hasattr(visualizer, "obstacles") and len(visualizer.obstacles) > 0:
+                # prefer policy-provided settings if available
+                if hasattr(self.policy, "diffusion") and hasattr(self.policy.diffusion, "obs_margin"):
+                    margin = float(self.policy.diffusion.obs_margin)
+                    alpha = float(self.policy.diffusion.obs_alpha)
+                else:
+                    margin = 0.2
+                    alpha = 10.0
+                device = get_device_from_parameters(self.policy)
+                actions_dev = actions.to(device)
+                obs_terms = torch_sdf_penalty(actions_dev, visualizer.obstacles, margin=margin, alpha=alpha)
+                if obs_terms is not None:
+                    obs_terms = obs_terms.cpu()
+                    # stash per-timestamp penalty values for inspection or logging
+                    with self._thread_lock:
+                        self._last_obstacle_penalties = {
+                            observation_timestamp_ms + i * self.period_ms: float(obs_terms[i].item())
+                            for i in range(obs_terms.shape[0])
+                        }
+        except Exception as e:
+            logging.warning("Failed to compute obstacle penalties: %s", e)
         # Update action cache.
         with self._thread_lock:
             self._action_cache.update(

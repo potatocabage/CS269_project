@@ -40,6 +40,7 @@ from common.policies.utils import (
     get_dtype_from_parameters,
 )
 import time
+from common.utils.obstacles import torch_sdf_penalty
 
 class DiffusionPolicy(nn.Module, PyTorchModelHubMixin):
     """
@@ -166,6 +167,13 @@ class DiffusionModel(nn.Module):
 
         assert alginment_strategy in ['post-hoc', 'guided-diffusion', 'stochastic-sampling', 'biased-initialization', 'output-perturb'], 'Invalid alignment strategy: ' + str(alginment_strategy)
         self.alignment_strategy = alginment_strategy
+        # obstacle guidance hyperparameters (used at inference if visualizer provides obstacles)
+        # weight for obstacle penalty
+        self.obs_weight = 1.0
+        # safety margin (maze units)
+        self.obs_margin = 0.2
+        # sharpness for softplus
+        self.obs_alpha = 10.0
 
     # ========= inference  ============
     def conditional_sample(
@@ -223,7 +231,7 @@ class DiffusionModel(nn.Module):
 
                 # add interaction gradient
                 if guide is not None and t > final_influence_step:
-                    grad = self.guide_gradient(sample, guide)
+                    grad = self.guide_gradient(sample, guide, visualizer)
                     if self.alignment_strategy == 'guided-diffusion':
                         guide_ratio = 20 
                     elif self.alignment_strategy == 'stochastic-sampling':
@@ -251,7 +259,7 @@ class DiffusionModel(nn.Module):
 
         return sample
     
-    def guide_gradient(self, naction, guide):
+    def guide_gradient(self, naction, guide, visualizer=None):
         # naction: (B, pred_horizon, action_dim);
         # guide: (guide_horizon, action_dim)
         # print('noisy action shape:', naction.shape, 'guide shape:', guide.shape)
@@ -266,7 +274,25 @@ class DiffusionModel(nn.Module):
             naction = naction.clone().detach().requires_grad_(True)
             dist = torch.linalg.norm(naction - guide, dim=2, ord=2) # (B, pred_horizon)
             dist = dist.mean(dim=1) # (B,)
-            grad = torch.autograd.grad(dist, naction, grad_outputs=torch.ones_like(dist), create_graph=False)[0]
+            # obstacle-aware penalty (if visualizer provides obstacles) but respect per-strategy enable flags
+            obs_term = None
+            if visualizer is not None and hasattr(visualizer, "obstacles") and len(visualizer.obstacles) > 0:
+                enabled = False
+                # check per-alignment flags (default to True if attribute absent)
+                if self.alignment_strategy == 'guided-diffusion' and getattr(self, 'enable_obs_guided_diffusion', True):
+                    enabled = True
+                if self.alignment_strategy == 'stochastic-sampling' and getattr(self, 'enable_obs_stochastic_sampling', True):
+                    enabled = True
+                # If enabled for this strategy, compute the torch SDF penalty
+                if enabled:
+                    obs_term = torch_sdf_penalty(naction, visualizer.obstacles, margin=self.obs_margin, alpha=self.obs_alpha)
+
+            if obs_term is not None:
+                total_obj = dist + float(self.obs_weight) * obs_term
+            else:
+                total_obj = dist
+
+            grad = torch.autograd.grad(total_obj, naction, grad_outputs=torch.ones_like(total_obj), create_graph=False)[0]
             # naction.detach()
         return grad    
 

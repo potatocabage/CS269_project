@@ -56,6 +56,7 @@ from common.datasets.factory import make_dataset
 from scipy.special import softmax
 import time
 import json
+from common.utils.obstacles import numpy_sdf_penalty
 
 class MazeEnv:
     def __init__(self):
@@ -97,16 +98,39 @@ class MazeEnv:
         self.clock = pygame.time.Clock()
         self.agent_gui_pos = np.array([0, 0]) # Initialize the position of the red dot
         self.running = True
+        # obstacles: list of tuples (cx, cy, r) in maze xy coordinates
+        # Example: add a couple of small obstacles for testing
+        self.obstacles = [
+            (3.25, 3.5, 0.1),
+            (7.25, 3.75, 0.1),
+            (7.25, 6.0, 0.1),
+        ]
+        # obstacle scoring / guidance parameters (defaults can be overridden via CLI)
+        self.lambda_obs = 1.0
+        self.obs_margin = 0.2
+        self.obs_alpha = 10.0
+        # per-strategy enable flags (True by default)
+        self.enable_obs_pr = True
 
     def check_collision(self, xy_traj):
         assert xy_traj.shape[2] == 2, "Input must be a 2D array of (x, y) coordinates."
         batch_size, num_steps, _ = xy_traj.shape
-        xy_traj = xy_traj.reshape(-1, 2)
-        xy_traj = np.clip(xy_traj, [0, 0], [self.maze.shape[0] - 1, self.maze.shape[1] - 1])
-        maze_x = np.round(xy_traj[:, 0]).astype(int)
-        maze_y = np.round(xy_traj[:, 1]).astype(int)
-        collisions = self.maze[maze_x, maze_y]
-        collisions = collisions.reshape(batch_size, num_steps)
+        pts = xy_traj.reshape(-1, 2)
+        pts = np.clip(pts, [0, 0], [self.maze.shape[0] - 1, self.maze.shape[1] - 1])
+        maze_x = np.round(pts[:, 0]).astype(int)
+        maze_y = np.round(pts[:, 1]).astype(int)
+        # Maze collisions as (batch_size, num_steps)
+        collisions = self.maze[maze_x, maze_y].reshape(batch_size, num_steps)
+
+        # check collisions with circular obstacles and combine
+        if len(self.obstacles) > 0:
+            obs_coll = np.zeros((pts.shape[0],), dtype=bool)
+            for (cx, cy, r) in self.obstacles:
+                d = np.linalg.norm(pts - np.array([cx, cy]), axis=1) - r
+                obs_coll = obs_coll | (d < 0)
+            obs_coll = obs_coll.reshape(batch_size, num_steps)
+            collisions = collisions | obs_coll
+
         return np.any(collisions, axis=1)
     
     def find_first_collision_from_GUI(self, gui_traj):
@@ -152,6 +176,14 @@ class MazeEnv:
         surface = pygame.surfarray.make_surface(255 - np.swapaxes(np.repeat(self.maze[:, :, np.newaxis] * 255, 3, axis=2).astype(np.uint8), 0, 1))
         surface = pygame.transform.scale(surface, self.gui_size)
         self.screen.blit(surface, (0, 0))
+        # draw circular obstacles (in GUI coordinates)
+        if len(self.obstacles) > 0:
+            for (cx, cy, r) in self.obstacles:
+                gui_center = self.xy2gui(np.array([cx, cy]))
+                # convert radius in maze units to gui pixels (average scale)
+                # approximate: radius in x direction
+                r_px = int(r * (self.gui_size[1] / (self.maze.shape[0])))
+                pygame.draw.circle(self.screen, (50, 50, 50), (int(gui_center[0]), int(gui_center[1])), max(2, r_px))
 
     def update_screen(self, xy_pred=None, collisions=None, scores=None, keep_drawing=False, traj_in_gui_space=False):
         self.draw_maze_background()
@@ -196,12 +228,32 @@ class MazeEnv:
         indices = np.linspace(0, guide.shape[0]-1, samples.shape[1], dtype=int)
         guide = np.expand_dims(guide[indices], axis=0) # (1, pred_horizon, action_dim)
         guide = np.tile(guide, (samples.shape[0], 1, 1)) # (B, pred_horizon, action_dim)
-        scores = np.linalg.norm(samples[:, :] - guide[:, :], axis=2, ord=2).mean(axis=1) # (B,)
-        scores = 1 - scores / (scores.max() + 1e-6) # normalize
+        # alignment score (lower L2 distance -> higher similarity)
+        align_dist = np.linalg.norm(samples[:, :] - guide[:, :], axis=2, ord=2).mean(axis=1) # (B,)
+        # convert to similarity where larger is better
+        sim = 1 - align_dist / (align_dist.max() + 1e-6)
         temperature = 20
-        scores = softmax(scores*temperature)
-        # normalize the score to be between 0 and 1
-        scores = (scores - scores.min()) / (scores.max() - scores.min())
+        sim = softmax(sim * temperature)
+        # normalize similarity to [0,1]
+        sim = (sim - sim.min()) / (sim.max() - sim.min() + 1e-9)
+
+        # obstacle penalty (higher means worse). If obstacles exist, compute softplus penalty averaged over time and obstacles
+        lambda_obs = getattr(self, 'lambda_obs', 1.0)
+        obs_pen = np.zeros((samples.shape[0],), dtype=float)
+        if not getattr(self, 'enable_obs_pr', True):
+            lambda_obs = 0.0
+        if hasattr(self, 'obstacles') and len(self.obstacles) > 0 and lambda_obs > 0:
+            m = getattr(self, 'obs_margin', 0.2)
+            alpha = getattr(self, 'obs_alpha', 10.0)
+            # use shared numpy SDF penalty util (returns (B,) raw penalty)
+            obs_pen = numpy_sdf_penalty(samples, self.obstacles, margin=m, alpha=alpha)
+            # normalize obs_pen to [0,1]
+            obs_pen = (obs_pen - obs_pen.min()) / (obs_pen.max() - obs_pen.min() + 1e-9)
+
+        # final score: prefer high similarity and low obstacle penalty
+        scores = sim - lambda_obs * obs_pen
+        # re-normalize for visualization
+        scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
         # sort the predictions based on scores, from smallest to largest, so that larger scores will be drawn on top
         sort_idx = np.argsort(scores)
         samples = samples[sort_idx]
@@ -226,21 +278,29 @@ class UnconditionalMaze(MazeEnv):
 
         obs_batch = {
             "observation.state": einops.repeat(
-                torch.from_numpy(agent_hist_xy).float().cuda(), "t d -> b t d", b=self.batch_size
+                torch.from_numpy(agent_hist_xy).float().to(device), "t d -> b t d", b=self.batch_size
             )
         }
         obs_batch["observation.environment_state"] = einops.repeat(
-            torch.from_numpy(agent_hist_xy).float().cuda(), "t d -> b t d", b=self.batch_size
+            torch.from_numpy(agent_hist_xy).float().to(device), "t d -> b t d", b=self.batch_size
         )
         
         if guide is not None:
-            guide = torch.from_numpy(guide).float().cuda()
+            guide = torch.from_numpy(guide).float().to(device)
 
-        with torch.autocast(device_type="cuda"), seeded_context(0):
-            if self.policy_tag == 'act':
-                actions = self.policy.run_inference(obs_batch).cpu().numpy()
-            else:
-                actions = self.policy.run_inference(obs_batch, guide=guide, visualizer=visualizer).cpu().numpy() # directly call the policy in order to visualize the intermediate steps
+        # Use autocast only on CUDA; fall back to plain context on CPU
+        if device.type == 'cuda':
+            with torch.autocast(device_type="cuda"), seeded_context(0):
+                if self.policy_tag == 'act':
+                    actions = self.policy.run_inference(obs_batch).cpu().numpy()
+                else:
+                    actions = self.policy.run_inference(obs_batch, guide=guide, visualizer=visualizer).cpu().numpy() # directly call the policy in order to visualize the intermediate steps
+        else:
+            with seeded_context(0):
+                if self.policy_tag == 'act':
+                    actions = self.policy.run_inference(obs_batch).cpu().numpy()
+                else:
+                    actions = self.policy.run_inference(obs_batch, guide=guide, visualizer=visualizer).cpu().numpy() # directly call the policy in order to visualize the intermediate steps
         return actions
 
     def update_mouse_pos(self):
@@ -472,11 +532,16 @@ if __name__ == "__main__":
     parser.add_argument('-v', '--vis_dp_dynamics', action='store_true', help="Visualize dynamics in DP")
     parser.add_argument('-s', '--savepath', type=str, default=None, help="Filename to save the drawing")
     parser.add_argument('-l', '--loadpath', type=str, default=None, help="Filename to load the drawing")
+    # obstacle guidance / scoring hyperparameters
+    parser.add_argument('--obs-weight', type=float, default=1.0, help="Obstacle weight (lambda) applied in post-hoc scoring and guidance")
+    parser.add_argument('--obs-margin', type=float, default=0.2, help="Safety margin m for SDF softplus(m - d)")
+    parser.add_argument('--obs-alpha', type=float, default=10.0, help="Sharpness alpha for softplus")
 
     args = parser.parse_args()
 
     # Create and load the policy
-    device = torch.device("cuda")
+    # Use CUDA if available, otherwise fall back to CPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     alignment_strategy = 'post-hoc'
     if args.post_hoc:
@@ -507,12 +572,12 @@ if __name__ == "__main__":
         policy.diffusion.num_inference_steps = 10
         policy.config.n_action_steps = policy.config.horizon - policy.config.n_obs_steps + 1
         policy_tag = 'dp'
-        policy.cuda()
+        policy.to(device)
         policy.eval()
     elif args.policy in ["act"]:
         policy = ACTPolicy.from_pretrained(pretrained_policy_path)
         policy_tag = 'act'
-        policy.cuda()
+        policy.to(device)
         policy.eval()
     else:
         policy = None
@@ -537,4 +602,19 @@ if __name__ == "__main__":
         interactiveMaze = MazeExp(policy, args.vis_dp_dynamics, savepath, alignment_strategy, policy_tag=policy_tag, loadpath=args.loadpath)
     else:
         interactiveMaze = ConditionalMaze(policy, args.vis_dp_dynamics, args.savepath, alignment_strategy, policy_tag=policy_tag)
+
+    # Apply obstacle hyperparameters to the interactive maze and policy. Defaults keep obstacle logic enabled.
+    interactiveMaze.lambda_obs = float(args.obs_weight)
+    interactiveMaze.obs_margin = float(args.obs_margin)
+    interactiveMaze.obs_alpha = float(args.obs_alpha)
+    interactiveMaze.enable_obs_pr = True
+
+    if policy is not None and hasattr(policy, "diffusion"):
+        # set numeric hyperparams
+        policy.diffusion.obs_weight = float(args.obs_weight)
+        policy.diffusion.obs_margin = float(args.obs_margin)
+        policy.diffusion.obs_alpha = float(args.obs_alpha)
+        # keep per-strategy guidance enabled by default (alignment_strategy controls whether guidance runs)
+        policy.diffusion.enable_obs_guided_diffusion = True
+        policy.diffusion.enable_obs_stochastic_sampling = True
     interactiveMaze.run()
