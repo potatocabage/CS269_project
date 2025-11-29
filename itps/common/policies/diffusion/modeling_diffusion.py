@@ -181,6 +181,26 @@ class DiffusionModel(nn.Module):
         self.maze = None  # Will be a torch.Tensor of shape (maze_height, maze_width) with 1 for walls, 0 for free space
         self.maze_cost_weight = 0.0  # Weight for maze wall cost function (can be set during inference)
         self.apply_cost_on_clean = False # Whether to apply the cost on the estimated clean sample or the noisy sample
+
+        # Registry mapping cost_type strings -> callable(trajectory_unnorm) -> gradient
+        # We use lambdas/closures so the functions can reference `self.maze_segments` when it's set by `set_maze`.
+        self._maze_cost_registry = {
+            'barrier': lambda traj: clamped_barrier_cost_gradient(traj, self.maze_segments),
+            'intersection': lambda traj: calculate_trajectory_intersection_cost_gradient(traj, self.maze_segments),
+            'virtual_tail': lambda traj: calculate_virtual_tail_cost_gradient(traj, self.maze_segments),
+            'combo': lambda traj: calculate_combo_trajectory_intersection_and_virtual_tail_cost_gradient(traj, self.maze_segments),
+            'self_overlap': lambda traj: calculate_self_overlap_cost_gradient(traj),
+            'combo_virtual_tail_and_self_overlap': lambda traj: calculate_combo_virtual_tail_and_self_overlap_cost_gradient(traj, self.maze_segments),
+        }
+
+    def register_maze_cost(self, name: str, func):
+        """Register a custom maze cost gradient function.
+
+        Args:
+            name: key used to select this cost in `maze_wall_cost_gradient`.
+            func: callable(trajectory_unnorm: Tensor) -> Tensor gradient of same shape as trajectory.
+        """
+        self._maze_cost_registry[name] = func
     
     def set_maze(self, maze: Tensor, cost_weight: float = 1.0, apply_on_clean: bool = False):
         """
@@ -385,20 +405,13 @@ class DiffusionModel(nn.Module):
                 # Assume coordinates are already in maze space (for backward compatibility)
                 naction_unnorm = naction_normalized
             
-            if cost_type == 'barrier':
-                grad = clamped_barrier_cost_gradient(naction_unnorm, self.maze_segments)
-            elif cost_type == 'intersection':
-                grad = calculate_trajectory_intersection_cost_gradient(naction_unnorm, self.maze_segments)
-            elif cost_type == 'virtual_tail':
-                grad = calculate_virtual_tail_cost_gradient(naction_unnorm, self.maze_segments)
-            elif cost_type == 'combo':
-                grad = calculate_combo_trajectory_intersection_and_virtual_tail_cost_gradient(naction_unnorm, self.maze_segments)
-            elif cost_type == 'self_overlap':
-                grad = calculate_self_overlap_cost_gradient(naction_unnorm)
-            elif cost_type == 'combo_virtual_tail_and_self_overlap':
-                grad = calculate_combo_virtual_tail_and_self_overlap_cost_gradient(naction_unnorm, self.maze_segments)
-            else:
+            # Dispatch using registry to keep selection readable and extensible.
+            try:
+                cost_fn = self._maze_cost_registry[cost_type]
+            except KeyError:
                 raise ValueError(f"Unknown cost type: {cost_type}")
+
+            grad = cost_fn(naction_unnorm)
             
         return grad    
 

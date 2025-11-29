@@ -4,6 +4,16 @@ import argparse
 import time
 import json
 import numpy as np
+import imageio
+
+# Centralized UI constants
+from common.ui_constants import (
+    DEFAULT_BASE_H_MIN,
+    MAIN_FONT_SCALE, MAIN_FONT_MIN,
+    TITLE_FONT_SCALE, TITLE_FONT_MIN,
+    LEGEND_FONT_SCALE, LEGEND_FONT_MIN,
+    LABEL_FONT_SCALE, LABEL_FONT_MIN,
+)
 import pygame
 import torch
 import einops
@@ -18,12 +28,10 @@ from common.utils.utils import seeded_context
 from common.policies.utils import get_device_from_parameters
 from interact_maze2d import MazeEnv, UnconditionalMaze
 
-import imageio
-
 class StepCollector:
     def __init__(self):
         self.steps = []
-    
+
     def update_screen(self, xy_pred, keep_drawing=True, label=None, **kwargs):
         # xy_pred is (B, T, 2) or (T, 2)
         # We store CPU numpy copy
@@ -74,11 +82,11 @@ class DenoisingVizEnv(MazeEnv):
         self.draw_maze_background_to_surface(self.old_maze_bg_surface, maze_array=getattr(self, 'old_maze', None))
         
         # Scale fonts relative to GUI panel height so labels and legend fit small windows
-        base_h = max(100, self.gui_size[1])
-        main_font_size = max(12, int(base_h * 0.08))
-        title_font_size = max(12, int(base_h * 0.06))
-        legend_font_size = max(10, int(base_h * 0.045))
-        label_font_size = max(10, int(base_h * 0.05))
+        base_h = max(DEFAULT_BASE_H_MIN, self.gui_size[1])
+        main_font_size = max(MAIN_FONT_MIN, int(base_h * MAIN_FONT_SCALE))
+        title_font_size = max(TITLE_FONT_MIN, int(base_h * TITLE_FONT_SCALE))
+        legend_font_size = max(LEGEND_FONT_MIN, int(base_h * LEGEND_FONT_SCALE))
+        label_font_size = max(LABEL_FONT_MIN, int(base_h * LABEL_FONT_SCALE))
 
         self.font = pygame.font.SysFont(None, main_font_size)
         self.title_font = pygame.font.SysFont(None, title_font_size)
